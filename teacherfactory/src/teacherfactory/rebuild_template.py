@@ -99,7 +99,7 @@ def build_template():
     doc.add_paragraph()  # пустая строка
     doc.add_paragraph("Ход занятия")
 
-    lesson_table = doc.add_table(rows=2, cols=7)
+    lesson_table = doc.add_table(rows=3, cols=7)
     lesson_table.style = 'Table Grid'
 
     # Заголовок
@@ -108,7 +108,8 @@ def build_template():
     for i, h in enumerate(headers):
         lesson_table.rows[0].cells[i].text = h
 
-    # Строка-шаблон: {%tr for/endfor %} повторяет СТРОКУ таблицы, а не содержимое ячейки
+    # for и endfor в РАЗНЫХ строках — docxtpl удаляет обе строки-маркеры,
+    # строку 1 дублирует для каждого шага, строку 2 убирает целиком
     template_row = lesson_table.rows[1]
     template_row.cells[0].text = "{%tr for step in lesson_structure %}{{ step.number }}"
     template_row.cells[1].text = "{{ step.stage }}"
@@ -116,7 +117,9 @@ def build_template():
     template_row.cells[3].text = "{{ step.teacher }}"
     template_row.cells[4].text = "{{ step.student }}"
     template_row.cells[5].text = "{{ step.methods }}"
-    template_row.cells[6].text = "{{ step.result }}{%tr endfor %}"
+    template_row.cells[6].text = "{{ step.result }}"
+
+    lesson_table.rows[2].cells[0].text = "{%tr endfor %}"
 
     doc.save(str(OUTPUT_PATH))
     print(f"Шаблон пересоздан: {OUTPUT_PATH}")
