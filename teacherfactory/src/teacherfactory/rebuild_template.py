@@ -108,15 +108,15 @@ def build_template():
     for i, h in enumerate(headers):
         lesson_table.rows[0].cells[i].text = h
 
-    # Строка с jinja-циклом (используем for/endfor вместо tr)
+    # Строка-шаблон: {%tr for/endfor %} повторяет СТРОКУ таблицы, а не содержимое ячейки
     template_row = lesson_table.rows[1]
-    template_row.cells[0].text = "{%for step in lesson_structure %}{{ step.number }}"
+    template_row.cells[0].text = "{%tr for step in lesson_structure %}{{ step.number }}"
     template_row.cells[1].text = "{{ step.stage }}"
     template_row.cells[2].text = "{{ step.time }}"
     template_row.cells[3].text = "{{ step.teacher }}"
     template_row.cells[4].text = "{{ step.student }}"
     template_row.cells[5].text = "{{ step.methods }}"
-    template_row.cells[6].text = "{{ step.result }}{%endfor %}"
+    template_row.cells[6].text = "{{ step.result }}{%tr endfor %}"
 
     doc.save(str(OUTPUT_PATH))
     print(f"Шаблон пересоздан: {OUTPUT_PATH}")
