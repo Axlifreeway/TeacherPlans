@@ -1,0 +1,24 @@
+# Настройки по умолчанию (для ноутбука / слабого железа).
+#
+# Чтобы переопределить под конкретную машину — создай рядом файл
+# config.local.toml (он в .gitignore) и впиши только нужные ключи.
+#
+# Пример config.local.toml для десктопа (RTX 3080 Ti, 32 GB RAM):
+#
+#   [model]
+#   llm = "qwen2.5:14b"
+#   num_gpu = -1
+#
+# ВАЖНО: смена embeddings требует полного перестроения индекса!
+
+[model]
+llm = "llama3.1:8b"
+embeddings = "nomic-embed-text"
+temperature = 0.1        # для генерации карт (низкая = детерминированно)
+chat_temperature = 0.7   # для свободного чата
+num_gpu = 0              # 0 = CPU only, -1 = все слои на GPU
+
+[rag]
+chunk_size = 800
+chunk_overlap = 200
+retrieval_k = 5          # сколько чанков брать из индекса

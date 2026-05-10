@@ -1,24 +1,31 @@
 """
 Генератор технологических карт уроков.
 
-Пайплайн: RAG-поиск по документам → LLM-генерация → DOCX-рендеринг.
+Пайплайн: гибридный RAG-поиск (FAISS + BM25 → RRF) → LLM-генерация → DOCX-рендеринг.
 
 Запуск: poetry run python src/teacherfactory/generator.py
 """
 
+import logging
+import pickle
+from collections.abc import Generator
 from pathlib import Path
-from langchain_ollama import ChatOllama, OllamaEmbeddings
-from langchain_community.vectorstores import FAISS
-from langchain_core.prompts import ChatPromptTemplate
-from docxtpl import DocxTemplate
 
+from docxtpl import DocxTemplate
+from langchain_community.vectorstores import FAISS
+from langchain_core.documents import Document
+from langchain_core.prompts import ChatPromptTemplate
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+
+from config import CONFIG
 from model import LessonCard
 
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+log = logging.getLogger(__name__)
 
-# Пути
 PROJECT_ROOT = Path(__file__).parent.parent.parent
-# FAISS не может работать с кириллическими путями
 INDEX_DIR = Path.home() / ".teacherfactory" / "faiss_index"
+BM25_PATH = INDEX_DIR / "bm25.pkl"
 TEMPLATE_PATH = PROJECT_ROOT / "template_fixed.docx"
 OUTPUT_DIR = Path.home() / ".teacherfactory" / "output"
 
@@ -52,26 +59,92 @@ USER_PROMPT = """Составь технологическую карту уро
 Включи 5-7 этапов в ход занятия. Все тексты — на русском языке.
 """
 
+CHAT_SYSTEM_PROMPT = """Ты — помощник методиста СПО в России.
+Отвечай на вопросы об образовательном процессе, компетенциях, программах обучения,
+используя ТОЛЬКО информацию из предоставленного контекста нормативных документов.
+Если в контексте нет ответа — честно скажи об этом.
+Отвечай развёрнуто и по существу, на русском языке.
 
-def load_index() -> FAISS:
-    """Загрузить FAISS-индекс с диска."""
+КОНТЕКСТ ИЗ НОРМАТИВНЫХ ДОКУМЕНТОВ:
+{context}
+"""
+
+
+def _tokenize(text: str) -> list[str]:
+    return text.lower().split()
+
+
+def load_index() -> tuple[FAISS, dict | None]:
+    """Загрузить FAISS и (если есть) BM25 индекс."""
     if not INDEX_DIR.exists() or not any(INDEX_DIR.iterdir()):
         raise FileNotFoundError(
             f"FAISS-индекс не найден в {INDEX_DIR}. "
             "Сначала запусти indexer.py: poetry run python src/teacherfactory/indexer.py"
         )
-    embeddings = OllamaEmbeddings(model="nomic-embed-text")
-    return FAISS.load_local(str(INDEX_DIR), embeddings, allow_dangerous_deserialization=True)
+    embeddings = OllamaEmbeddings(model=CONFIG["model"]["embeddings"])
+    db = FAISS.load_local(str(INDEX_DIR), embeddings, allow_dangerous_deserialization=True)
+
+    bm25_data = None
+    if BM25_PATH.exists():
+        with open(BM25_PATH, "rb") as f:
+            bm25_data = pickle.load(f)
+        log.info("BM25-индекс загружен (%d чанков)", len(bm25_data["chunks"]))
+    else:
+        log.warning("BM25-индекс не найден — используется только FAISS. Перестройте индекс.")
+
+    return db, bm25_data
 
 
-def retrieve_context(db: FAISS, query: str, k: int = 5) -> str:
-    """Найти релевантные куски из документов."""
-    docs = db.similarity_search(query, k=k)
+def retrieve_context(db: FAISS, bm25_data: dict | None, query: str, k: int | None = None) -> str:
+    """
+    Гибридный поиск: FAISS (dense) + BM25 (sparse), слияние через RRF.
+
+    BM25 критичен для точного поиска кодов компетенций (ОК-1, ПК-3),
+    где семантический поиск может промахнуться.
+    """
+    if k is None:
+        k = CONFIG["rag"]["retrieval_k"]
+
+    dense_docs = db.similarity_search(query, k=k * 2)
+
+    if bm25_data is not None:
+        tokens = _tokenize(query)
+        scores = bm25_data["bm25"].get_scores(tokens)
+        chunks: list[Document] = bm25_data["chunks"]
+        top_idx = sorted(range(len(scores)), key=lambda i: scores[i], reverse=True)[: k * 2]
+        sparse_docs = [chunks[i] for i in top_idx]
+    else:
+        sparse_docs = []
+
+    # RRF fusion (K=60 — стандартная константа)
+    K_RRF = 60
+    score_map: dict[str, float] = {}
+    doc_map: dict[str, Document] = {}
+
+    for rank, doc in enumerate(dense_docs):
+        key = doc.page_content[:120]
+        score_map[key] = score_map.get(key, 0.0) + 1.0 / (K_RRF + rank + 1)
+        doc_map[key] = doc
+
+    for rank, doc in enumerate(sparse_docs):
+        key = doc.page_content[:120]
+        score_map[key] = score_map.get(key, 0.0) + 1.0 / (K_RRF + rank + 1)
+        doc_map[key] = doc
+
+    top_keys = sorted(score_map, key=score_map.__getitem__, reverse=True)[:k]
+    top_docs = [doc_map[key] for key in top_keys]
+
+    log.info(
+        "Найдено %d чанков (dense=%d, sparse=%d)",
+        len(top_docs), len(dense_docs), len(sparse_docs),
+    )
+
     context_parts = []
-    for doc in docs:
+    for doc in top_docs:
         source = Path(doc.metadata.get("source", "неизвестно")).name
         page = doc.metadata.get("page", "?")
         context_parts.append(f"[Источник: {source}, стр. {page}]\n{doc.page_content}")
+
     return "\n\n---\n\n".join(context_parts)
 
 
@@ -84,38 +157,55 @@ def generate_lesson_card(params: dict) -> LessonCard:
         lesson_topic, lesson_number, date, teacher_name,
         lesson_type, lesson_kind, duration
     """
-    # 1. Загрузка индекса
-    print("Загружаю индекс...")
-    db = load_index()
+    log.info("Загружаю индекс...")
+    db, bm25_data = load_index()
 
-    # 2. RAG: поиск релевантного контекста
     search_query = f"{params['discipline']} {params['specialty']} компетенции знания умения навыки"
-    print(f"Ищу контекст по запросу: {search_query[:80]}...")
-    context = retrieve_context(db, search_query)
-    print(f"Найдено {context.count('[Источник:')} релевантных фрагментов")
+    log.info("Запрос: %s", search_query[:80])
+    context = retrieve_context(db, bm25_data, search_query)
 
-    # 3. Формирование промпта
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
         ("human", USER_PROMPT),
     ])
 
-    # 4. LLM с structured output
-    llm = ChatOllama(model="llama3.1:8b", temperature=0.1, num_gpu=0)
-    structured_llm = llm.with_structured_output(LessonCard)
+    llm = ChatOllama(
+        model=CONFIG["model"]["llm"],
+        temperature=CONFIG["model"]["temperature"],
+        num_gpu=CONFIG["model"]["num_gpu"],
+    )
+    chain = prompt | llm.with_structured_output(LessonCard)
 
-    # 5. Собираем цепочку: промпт → LLM
-    chain = prompt | structured_llm
-
-    # 6. Вызов
-    print("Генерирую технологическую карту (это может занять 1-2 минуты)...")
-    result = chain.invoke({
-        "context": context,
-        **params,
-    })
-
-    print(f"Карта сгенерирована: {result.lesson_topic}")
+    log.info("Генерирую карту для темы: %s (модель: %s)", params["lesson_topic"], CONFIG["model"]["llm"])
+    result = chain.invoke({"context": context, **params})
+    log.info("Карта готова: %s", result.lesson_topic)
     return result
+
+
+def stream_chat_response(question: str) -> Generator[str, None, None]:
+    """
+    Потоковый RAG-чат по документам без генерации файлов.
+
+    Полезен для вопросов об образовательном процессе, компетенциях,
+    программах обучения — не требует создания технологической карты.
+    """
+    db, bm25_data = load_index()
+    context = retrieve_context(db, bm25_data, question)
+
+    prompt = ChatPromptTemplate.from_messages([
+        ("system", CHAT_SYSTEM_PROMPT),
+        ("human", "{question}"),
+    ])
+
+    llm = ChatOllama(
+        model=CONFIG["model"]["llm"],
+        temperature=CONFIG["model"]["chat_temperature"],
+        num_gpu=CONFIG["model"]["num_gpu"],
+    )
+    chain = prompt | llm
+
+    for chunk in chain.stream({"context": context, "question": question}):
+        yield chunk.content
 
 
 def render_docx(card: LessonCard, output_path: Path) -> Path:
@@ -123,30 +213,22 @@ def render_docx(card: LessonCard, output_path: Path) -> Path:
     doc = DocxTemplate(str(TEMPLATE_PATH))
     context = card.to_template_context()
 
-    # docxtpl автоматически обрабатывает {% tr %} тег при рендеринге,
-    # но нужно убедиться что шаблон корректно загружен
     try:
         doc.render(context)
     except Exception as e:
-        # Если шаблон имеет проблемы с {% tr %}, попробуем без таблицы
-        print(f"Предупреждение при рендеринге: {e}")
-        print("Пробую сохранить без рендеринга таблицы хода занятия...")
-        # Убираем lesson_structure и рендерим без неё
-        context_without_table = {k: v for k, v in context.items() if k != "lesson_structure"}
-        context_without_table["lesson_structure"] = []
+        log.warning("Предупреждение при рендеринге: %s — пробую без таблицы хода", e)
+        context_safe = {**context, "lesson_structure": []}
         doc = DocxTemplate(str(TEMPLATE_PATH))
-        doc.render(context_without_table)
+        doc.render(context_safe)
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     doc.save(str(output_path))
-    print(f"Документ сохранён: {output_path}")
+    log.info("Документ сохранён: %s", output_path)
     return output_path
 
 
 def main():
     """Пример генерации одной карты."""
-
-    # Параметры урока — меняй под свои нужды
     params = {
         "discipline": "Компьютерные сети",
         "specialty": "09.01.03 Оператор информационных систем и ресурсов",
@@ -163,16 +245,11 @@ def main():
     }
 
     try:
-        # Генерация
         card = generate_lesson_card(params)
-
-        # Рендеринг в DOCX
         output_file = OUTPUT_DIR / f"Урок_{params['lesson_number']}_{params['discipline']}.docx"
         render_docx(card, output_file)
 
-        # Вывод результата
-        print("\n=== РЕЗУЛЬТАТ ===")
-        print(f"Тема: {card.lesson_topic}")
+        print(f"\nТема: {card.lesson_topic}")
         print(f"Цель: {card.goal}")
         print(f"ОК: {card.competencies_ok}")
         print(f"ПК: {card.competencies_pk}")
@@ -180,10 +257,8 @@ def main():
         for step in card.lesson_structure:
             print(f"  {step.number}. {step.stage} ({step.time})")
 
-    except FileNotFoundError as e:
-        print(f"Ошибка: {e}")
     except Exception as e:
-        print(f"Ошибка генерации: {e}")
+        log.error("Ошибка: %s", e)
         import traceback
         traceback.print_exc()
 
