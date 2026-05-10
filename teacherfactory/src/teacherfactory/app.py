@@ -21,7 +21,7 @@ from generator import (  # noqa: E402
     stream_chat_response,
     validate_competencies,
 )
-from indexer import INDEX_DIR, build_index  # noqa: E402
+from indexer import INDEX_DIR, build_index, DOCS_DIR  # noqa: E402
 
 OUTPUT_DIR = Path.home() / ".teacherfactory" / "output"
 
@@ -105,13 +105,25 @@ def main() -> None:
             st.warning("Индекс не построен")
 
         if st.button("Перестроить индекс", use_container_width=True):
-            with st.spinner("Индексирую PDF из папки docs/..."):
+            with st.spinner("Индексирую PDF/DOCX из папки docs/..."):
                 try:
                     build_index()
                     st.success("Индекс построен!")
                 except Exception as e:
                     st.error(f"Ошибка индексации: {e}")
             st.rerun()
+
+        # Предупреждение о .doc файлах
+        skipped_path = INDEX_DIR / "skipped_doc_files.txt"
+        if skipped_path.exists():
+            skipped = skipped_path.read_text(encoding="utf-8").strip().splitlines()
+            if skipped:
+                st.warning(
+                    f"⚠️ {len(skipped)} файл(ов) **не проиндексированы** "
+                    f"(формат .doc не поддерживается):\n\n"
+                    + "\n".join(f"- `{f}`" for f in skipped)
+                    + "\n\nСконвертируй через Word → «Сохранить как .docx»."
+                )
 
         st.divider()
         st.header("Общие сведения")

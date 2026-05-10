@@ -148,7 +148,63 @@ class _TokenCallback(BaseCallbackHandler):
 # ─── Утилиты ──────────────────────────────────────────────────────────────────
 
 def _tokenize(text: str) -> list[str]:
+    # Нормализуем коды: "ОК01" → "ОК 01", "ПК1.2" → "ПК 1.2"
+    text = re.sub(r'([ОП][КМ])\s*(\d)', r'\1 \2', text)
     return text.lower().split()
+
+
+# Маркеры запросов типа "перечисли все ОК/ПК" или "какие дисциплины"
+_LIST_INTENT_RE = re.compile(
+    r'(перечисл|список|все\s+(?:ок|пк)|полн|все\s+компетенц|какие\s+дисципл|дисципл\w+\s+направл)',
+    re.IGNORECASE,
+)
+
+# Паттерн специальности: "09.01.03", "10.02.05" и т.п.
+_SPECIALTY_CODE_RE = re.compile(r'\d{2}\.\d{2}\.\d{2}')
+
+
+def _retrieve_by_specialty(
+    bm25_data: dict,
+    specialty_code: str,
+    extra_query: str,
+    db: "FAISS",
+    k: int = 50,
+) -> str:
+    """
+    Для запросов типа "перечисли дисциплины 09.01.03" —
+    возвращает ВСЕ чанки из файлов, в чьём имени есть код специальности.
+    Дополняем семантическим поиском по всем документам для надёжности.
+    """
+    code_norm = specialty_code.replace(".", "")
+    matching: list[Document] = []
+
+    for chunk in bm25_data["chunks"]:
+        src = chunk.metadata.get("source", "")
+        src_norm = src.replace(".", "").replace("_", "").replace(" ", "")
+        if code_norm in src_norm:
+            matching.append(chunk)
+
+    # Сортируем по источнику + странице — сохраняем порядок документа
+    matching.sort(key=lambda c: (c.metadata.get("source", ""), c.metadata.get("page", 0)))
+
+    # Дополняем семантическим поиском на случай если файл назван иначе
+    semantic = db.similarity_search(f"{extra_query} {specialty_code}", k=15)
+    existing_keys = {c.page_content[:120] for c in matching}
+    for doc in semantic:
+        if doc.page_content[:120] not in existing_keys:
+            matching.append(doc)
+
+    context_parts = []
+    for doc in matching[:k]:
+        source = Path(doc.metadata.get("source", "неизвестно")).name
+        page = doc.metadata.get("page", "?")
+        context_parts.append(f"[Источник: {source}, стр. {page}]\n{doc.page_content}")
+
+    log.info(
+        "Фильтрация по специальности %s: %d чанков",
+        specialty_code, len(context_parts),
+    )
+    return "\n\n---\n\n".join(context_parts)
 
 
 def _make_llm(temperature: float | None = None, streaming: bool = False,
@@ -357,19 +413,37 @@ def stream_chat_response(question: str) -> Generator[str, None, None]:
     db, bm25_data = load_index()
     llm = _make_llm(temperature=CONFIG["model"]["chat_temperature"])
 
-    # HyDE: генерируем гипотетический документ для лучшего поиска
-    search_query: str | list[str] = question
-    if CONFIG["rag"].get("hyde_enabled", False):
-        try:
-            hyde_prompt = HYDE_PROMPT.format(question=question)
-            hypothetical = llm.invoke(hyde_prompt).content
-            # Ищем по обоим: HyDE-документ даёт семантику, оригинал — ключевые слова
-            search_query = [hypothetical, question]
-            log.info("HyDE: сгенерирован гипотетический документ (%d симв.)", len(hypothetical))
-        except Exception as e:
-            log.warning("HyDE не удался, ищу по оригинальному вопросу: %s", e)
+    is_list_query = bool(_LIST_INTENT_RE.search(question))
+    specialty_match = _SPECIALTY_CODE_RE.search(question)
 
-    context = retrieve_context(db, bm25_data, search_query, k=10)
+    # Если запрос называет конкретную специальность — берём ВСЕ чанки из её файлов
+    if specialty_match and bm25_data:
+        context = _retrieve_by_specialty(
+            bm25_data,
+            specialty_match.group(),
+            extra_query=question,
+            db=db,
+        )
+        log.info("Используется фильтрация по специальности %s", specialty_match.group())
+    else:
+        # Для запросов "перечисли все ОК/ПК" увеличиваем k
+        chat_k = CONFIG["rag"].get("chat_k", 15)
+        effective_k = chat_k * 2 if is_list_query else chat_k
+        if is_list_query:
+            log.info("Обнаружен запрос-перечисление, увеличиваю k до %d", effective_k)
+
+        # HyDE: генерируем гипотетический документ для лучшего поиска
+        search_query: str | list[str] = question
+        if CONFIG["rag"].get("hyde_enabled", False):
+            try:
+                hyde_prompt = HYDE_PROMPT.format(question=question)
+                hypothetical = llm.invoke(hyde_prompt).content
+                search_query = [hypothetical, question]
+                log.info("HyDE: сгенерирован гипотетический документ (%d симв.)", len(hypothetical))
+            except Exception as e:
+                log.warning("HyDE не удался, ищу по оригинальному вопросу: %s", e)
+
+        context = retrieve_context(db, bm25_data, search_query, k=effective_k)
 
     prompt = ChatPromptTemplate.from_messages([
         ("system", CHAT_SYSTEM_PROMPT),
