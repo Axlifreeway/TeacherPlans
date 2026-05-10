@@ -1,7 +1,8 @@
 """
 Индексатор документов для RAG.
 
-Загружает PDF из папки docs/, нарезает на чанки,
+Загружает PDF из папки docs/, нарезает на чанки с учётом структуры
+российских нормативных документов (разделы, таблицы, абзацы),
 создаёт FAISS-индекс (семантический) и BM25-индекс (ключевые слова).
 
 Запуск: poetry run python src/teacherfactory/indexer.py
@@ -23,9 +24,21 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger(__name__)
 
 DOCS_DIR = Path(__file__).parent.parent.parent / "docs"
-# FAISS не работает с кириллическими путями — сохраняем в домашней папке
 INDEX_DIR = Path.home() / ".teacherfactory" / "faiss_index"
 BM25_PATH = INDEX_DIR / "bm25.pkl"
+
+# Разделители в порядке приоритета: сначала крупные структурные границы,
+# потом мелкие. Строки (\n) идут раньше точек — это помогает не резать
+# таблицы компетенций посередине строки.
+_SEPARATORS = [
+    "\n\n\n",   # крупные разделы
+    "\n\n",     # абзацы
+    "\n",       # строки (важно для таблиц)
+    ". ",       # предложения
+    ", ",       # перечисления
+    " ",        # слова
+    "",         # символы (крайний случай)
+]
 
 
 def _tokenize(text: str) -> list[str]:
@@ -50,10 +63,14 @@ def build_index() -> None:
 
     log.info("Загружено %d страниц из %d файлов", len(all_docs), len(pdf_files))
 
-    # 2. Нарезка на чанки
+    # 2. Структурный чанкинг — уважает границы строк и абзацев
     chunk_size = CONFIG["rag"]["chunk_size"]
     chunk_overlap = CONFIG["rag"]["chunk_overlap"]
-    splitter = RecursiveCharacterTextSplitter(chunk_size=chunk_size, chunk_overlap=chunk_overlap)
+    splitter = RecursiveCharacterTextSplitter(
+        chunk_size=chunk_size,
+        chunk_overlap=chunk_overlap,
+        separators=_SEPARATORS,
+    )
     chunks = splitter.split_documents(all_docs)
     log.info("Нарезано %d чанков (size=%d, overlap=%d)", len(chunks), chunk_size, chunk_overlap)
 
@@ -61,13 +78,13 @@ def build_index() -> None:
 
     # 3. FAISS (dense — семантический поиск)
     embed_model = CONFIG["model"]["embeddings"]
-    log.info("Создаю эмбеддинги с моделью %s (это может занять 1-2 минуты)...", embed_model)
+    log.info("Создаю эмбеддинги с моделью %s...", embed_model)
     embeddings = OllamaEmbeddings(model=embed_model)
     db = FAISS.from_documents(chunks, embeddings)
     db.save_local(str(INDEX_DIR))
     log.info("FAISS-индекс сохранён в %s", INDEX_DIR)
 
-    # 4. BM25 (sparse — поиск по ключевым словам, важен для кодов ОК/ПК)
+    # 4. BM25 (sparse — точный поиск кодов ОК/ПК и ключевых терминов)
     corpus = [_tokenize(chunk.page_content) for chunk in chunks]
     bm25 = BM25Okapi(corpus)
     with open(BM25_PATH, "wb") as f:
@@ -75,13 +92,13 @@ def build_index() -> None:
     log.info("BM25-индекс сохранён: %s", BM25_PATH)
 
     # 5. Тестовый поиск
-    log.info("--- Тестовый поиск: 'общие компетенции' ---")
-    results = db.similarity_search("общие компетенции", k=3)
+    log.info("--- Тестовый поиск: 'профессиональные компетенции ПК' ---")
+    results = db.similarity_search("профессиональные компетенции ПК", k=3)
     for i, doc in enumerate(results, 1):
         source = Path(doc.metadata.get("source", "?")).name
         log.info(
             "[%d] %s (стр. %s): %s...",
-            i, source, doc.metadata.get("page", "?"), doc.page_content[:120],
+            i, source, doc.metadata.get("page", "?"), doc.page_content[:150],
         )
 
 

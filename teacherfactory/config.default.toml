@@ -17,8 +17,15 @@ embeddings = "nomic-embed-text"
 temperature = 0.1        # для генерации карт (низкая = детерминированно)
 chat_temperature = 0.7   # для свободного чата
 num_gpu = 0              # 0 = CPU only, -1 = все слои на GPU
+keep_alive = "10m"       # держать модель в VRAM между запросами
 
 [rag]
 chunk_size = 800
 chunk_overlap = 200
-retrieval_k = 5          # сколько чанков брать из индекса
+retrieval_k = 5           # финальное число чанков в контекст
+retrieval_candidates = 20 # кандидатов до reranking (берём с запасом)
+# Мультиязычный cross-encoder reranker (~120 MB, скачивается автоматически).
+reranker_model = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
+# HyDE: перед поиском в чате генерируем гипотетический ответ и ищем по нему.
+# Улучшает качество поиска для разговорных вопросов.
+hyde_enabled = true

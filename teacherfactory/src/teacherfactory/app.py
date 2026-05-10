@@ -15,7 +15,12 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import CONFIG  # noqa: E402
-from generator import generate_lesson_card, render_docx, stream_chat_response  # noqa: E402
+from generator import (  # noqa: E402
+    generate_lesson_card,
+    render_docx,
+    stream_chat_response,
+    validate_competencies,
+)
 from indexer import INDEX_DIR, build_index  # noqa: E402
 
 OUTPUT_DIR = Path.home() / ".teacherfactory" / "output"
@@ -135,6 +140,30 @@ def main() -> None:
         _tab_chat()
 
 
+# ─── Helpers для предпросмотра ────────────────────────────────────────────────
+
+def _render_competencies(text: str, validation: dict[str, bool]) -> None:
+    """Выводит текст компетенций, подсвечивая непроверенные коды."""
+    import re
+    from generator import COMPETENCY_RE
+
+    if not text or text.strip() == "Не указано в документах":
+        st.markdown(f"*{text}*")
+        return
+
+    lines = text.strip().splitlines()
+    for line in lines:
+        codes_in_line = COMPETENCY_RE.findall(line)
+        if codes_in_line:
+            unverified = [c for c in codes_in_line if validation.get(c) is False]
+            if unverified:
+                st.markdown(f"⚠️ {line}")
+            else:
+                st.markdown(f"✅ {line}")
+        else:
+            st.markdown(line)
+
+
 # ─── Вкладка: один урок ───────────────────────────────────────────────────────
 
 def _tab_single(teacher, specialty, course, group, students) -> None:
@@ -158,7 +187,6 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
         return
 
     if st.button("Сгенерировать карту", type="primary", use_container_width=True):
-        # Сбрасываем предыдущий результат при новой генерации
         st.session_state.pop("single_bytes", None)
 
         params = make_params(
@@ -168,16 +196,36 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
         fname = docx_filename(number, discipline)
         out_path = OUTPUT_DIR / fname
 
+        STAGE_LABELS = {
+            "index":    "1/3 — Загружаю индекс...",
+            "context":  "2/3 — Ищу контекст в документах...",
+            "generate": "3/3 — LLM генерирует карту...",
+        }
+
         with st.status("Генерирую технологическую карту...", expanded=True) as status:
+            stage_slot = st.empty()
+            token_slot = st.empty()
+
+            def on_stage(name: str) -> None:
+                stage_slot.markdown(f"**{STAGE_LABELS.get(name, name)}**")
+                if name != "generate":
+                    token_slot.empty()
+
+            def on_token(count: int) -> None:
+                token_slot.caption(f"токенов: {count}")
+
             try:
-                st.write("Загружаю индекс и ищу релевантный контекст...")
-                card = generate_lesson_card(params)
-                st.write("Рендерю DOCX...")
+                card = generate_lesson_card(params, on_token=on_token, on_stage=on_stage)
+                stage_slot.markdown("**Рендерю DOCX...**")
+                token_slot.empty()
                 render_docx(card, out_path)
                 with open(out_path, "rb") as f:
                     st.session_state["single_bytes"] = f.read()
                 st.session_state["single_fname"] = fname
                 st.session_state["single_card"] = card
+
+                stage_slot.markdown("**Проверяю компетенции...**")
+                st.session_state["validation"] = validate_competencies(card)
                 status.update(label="Готово!", state="complete")
             except Exception as e:
                 status.update(label=f"Ошибка: {e}", state="error")
@@ -186,18 +234,36 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
     if "single_bytes" in st.session_state:
         card = st.session_state["single_card"]
         fname = st.session_state["single_fname"]
+        validation: dict[str, bool] = st.session_state.get("validation", {})
 
         st.success(f"Карта готова: {card.lesson_topic}")
 
+        # Предупреждение о непроверенных компетенциях
+        unverified = [c for c, found in validation.items() if not found]
+        if unverified:
+            st.warning(
+                f"⚠️ Следующие коды **не найдены** в документах — возможно выдуманы моделью: "
+                f"`{'`, `'.join(unverified)}`"
+            )
+
         with st.expander("Предпросмотр"):
             st.markdown(f"**Цель:** {card.goal}")
-            st.markdown(f"**ОК:** {card.competencies_ok}")
-            st.markdown(f"**ПК:** {card.competencies_pk}")
+
+            # Компетенции с индикаторами валидации
+            st.markdown("**Общие компетенции (ОК):**")
+            _render_competencies(card.competencies_ok, validation)
+            st.markdown("**Профессиональные компетенции (ПК):**")
+            _render_competencies(card.competencies_pk, validation)
+
+            st.divider()
             st.markdown("**Ход занятия:**")
-            st.table([
-                {"№": s.number, "Этап": s.stage, "Время": s.time, "Методы": s.methods}
-                for s in card.lesson_structure
-            ])
+            for s in card.lesson_structure:
+                with st.expander(f"{s.number}. {s.stage} — {s.time}"):
+                    c1, c2 = st.columns(2)
+                    c1.markdown(f"**Преподаватель:**\n\n{s.teacher}")
+                    c1.markdown(f"**Методы:** {s.methods}")
+                    c2.markdown(f"**Студенты:**\n\n{s.student}")
+                    c2.markdown(f"**Результат:** {s.result}")
 
         st.download_button(
             label="Скачать DOCX",
