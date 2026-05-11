@@ -12,6 +12,7 @@ dependencies = [
     "pydantic (>=2.13.3,<3.0.0)",
     "docxtpl (>=0.20.2,<0.21.0)",
     "langchain-ollama (>=1.1.0,<2.0.0)",
+    "langchain-groq (>=0.3.0,<1.0.0)",
     "pypdf (>=6.10.2,<7.0.0)",
     "faiss-cpu (>=1.13.2,<2.0.0)",
     "langgraph (>=1.1.10,<2.0.0)",

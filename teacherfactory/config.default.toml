@@ -19,6 +19,20 @@ chat_temperature = 0.7   # для свободного чата
 num_gpu = 0              # 0 = CPU only, -1 = все слои на GPU
 keep_alive = "10m"       # держать модель в VRAM между запросами
 
+[groq]
+# API ключ Groq (получить бесплатно: https://console.groq.com/keys)
+# Раскомментируй и вставь свой ключ, чтобы использовать Groq вместо Ollama
+# Либо установи переменную окружения GROQ_API_KEY
+# api_key = "gsk_..."
+# model = "llama-3.1-8b-instant"  # или "llama-3.1-70b-versatile", "mixtral-8x7b-32768"
+
+# Доступные модели Groq:
+# - llama-3.1-8b-instant (быстрая, 8B параметров)
+# - llama-3.1-70b-versatile (качественная, 70B параметров)
+# - mixtral-8x7b-32768 (MoE архитектура)
+# - gemma-7b-it (Google)
+# Бесплатные лимиты: ~30 запросов/мин для 8B, ~15 запросов/мин для 70B
+
 [rag]
 chunk_size = 800
 chunk_overlap = 200
