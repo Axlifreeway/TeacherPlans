@@ -1,15 +1,12 @@
 """
-Streamlit-интерфейс TeacherFactory.
+Streamlit-интерфейс TeacherFactory с поддержкой Groq API.
 
-Запуск: poetry run streamlit run src/teacherfactory/app.py
+Запуск: poetry run streamlit run src/teacherfactory/app_with_groq.py
 
-Улучшения UX:
-- Переключатель LLM провайдеров в реальном времени
-- Стриминг ответов с эффектом "печатной машинки"
-- Индикаторы статуса провайдеров
-- Сохранение истории чата между сессиями
-- Кнопки быстрых действий
-- Блокировка интерфейса во время генерации
+Особенности:
+- Выбор источника LLM: Ollama (локально) или Groq (облако, бесплатно)
+- Для Groq требуется API ключ: https://console.groq.com/keys
+- Ключ добавляется в config.local.toml или через интерфейс
 """
 
 import io
@@ -24,15 +21,24 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from config import CONFIG  # noqa: E402
 from generator import (  # noqa: E402
+    generate_lesson_card,
     render_docx,
+    stream_chat_response,
     validate_competencies,
 )
 from indexer import INDEX_DIR, build_index, DOCS_DIR  # noqa: E402
-from llm_provider import (  # noqa: E402
-    get_llm_provider,
-    list_available_providers,
-    LLMProviderType,
-)
+
+# Пытаемся импортировать Groq-клиент
+try:
+    from groq_client import (
+        generate_with_groq,
+        stream_chat_with_groq,
+        is_groq_configured,
+        get_groq_model_info,
+    )
+    GROQ_AVAILABLE = True
+except ImportError:
+    GROQ_AVAILABLE = False
 
 OUTPUT_DIR = Path.home() / ".teacherfactory" / "output"
 
@@ -58,97 +64,6 @@ LESSON_KINDS = [
 
 def index_ready() -> bool:
     return INDEX_DIR.exists() and any(INDEX_DIR.iterdir())
-
-
-def get_provider_for_session():
-    """Получить LLM провайдер из сессии или создать новый."""
-    if 'llm_provider' not in st.session_state:
-        try:
-            # Получаем выбранный тип провайдера
-            selected_type = st.session_state.get('selected_llm_type')
-            if selected_type:
-                provider_type = LLMProviderType(selected_type)
-                st.session_state['llm_provider'] = get_llm_provider(provider_type=provider_type)
-            else:
-                st.session_state['llm_provider'] = get_llm_provider()
-        except ValueError as e:
-            st.error(f"Ошибка инициализации LLM: {e}")
-            return None
-    return st.session_state['llm_provider']
-
-
-def generate_lesson_card_with_provider(params: dict, provider=None):
-    """Генерация карты урока через выбранный провайдер."""
-    from generator import (
-        SYSTEM_PROMPT, USER_PROMPT, 
-        retrieve_context, load_index, _lesson_search_queries
-    )
-    from langchain_core.prompts import ChatPromptTemplate
-    
-    if provider is None:
-        provider = get_provider_for_session()
-    
-    db, bm25_data = load_index()
-    queries = _lesson_search_queries(params["discipline"], params["specialty"])
-    context = retrieve_context(db, bm25_data, queries)
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human", USER_PROMPT),
-    ])
-    
-    chain = prompt | provider._get_client().with_structured_output(
-        __import__('model', fromlist=['LessonCard']).LessonCard
-    )
-    
-    result = chain.invoke({"context": context, **params})
-    return result
-
-
-def stream_chat_response_with_provider(question: str, provider=None):
-    """Потоковый чат через выбранный провайдер."""
-    from generator import (
-        CHAT_SYSTEM_PROMPT, HYDE_PROMPT,
-        retrieve_context, load_index,
-        _LIST_INTENT_RE, _SPECIALTY_CODE_RE,
-        _retrieve_by_specialty
-    )
-    from langchain_core.prompts import ChatPromptTemplate
-    
-    if provider is None:
-        provider = get_provider_for_session()
-    
-    db, bm25_data = load_index()
-    
-    is_list_query = bool(_LIST_INTENT_RE.search(question))
-    specialty_match = _SPECIALTY_CODE_RE.search(question)
-    
-    if specialty_match and bm25_data:
-        context = _retrieve_by_specialty(
-            bm25_data,
-            specialty_match.group(),
-            extra_query=question,
-            db=db,
-        )
-    else:
-        chat_k = CONFIG["rag"].get("chat_k", 15)
-        effective_k = chat_k * 2 if is_list_query else chat_k
-        
-        search_query = question
-        if CONFIG["rag"].get("hyde_enabled", False):
-            try:
-                hyde_prompt = HYDE_PROMPT.format(question=question)
-                hypothetical = provider.generate(hyde_prompt)
-                search_query = [hypothetical, question]
-            except Exception as e:
-                pass
-        
-        context = retrieve_context(db, bm25_data, search_query, k=effective_k)
-    
-    messages = [{"role": "user", "content": f"Контекст:\n{context}\n\nВопрос: {question}"}]
-    
-    for chunk in provider.stream_chat(messages, system_prompt=CHAT_SYSTEM_PROMPT):
-        yield chunk
 
 
 def make_params(
@@ -185,6 +100,17 @@ def docx_filename(number: int, discipline: str) -> str:
     return f"Урок_{number}_{discipline}.docx"
 
 
+def get_llm_source() -> str:
+    """Определить текущий источник LLM."""
+    if GROQ_AVAILABLE and is_groq_configured():
+        return st.session_state.get("llm_source", "groq")
+    return st.session_state.get("llm_source", "ollama")
+
+
+def set_llm_source(source: str) -> None:
+    st.session_state["llm_source"] = source
+
+
 # ─── Main ─────────────────────────────────────────────────────────────────────
 
 def main() -> None:
@@ -200,60 +126,6 @@ def main() -> None:
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("🔧 Настройки LLM")
-        
-        # Получаем доступные провайдеры
-        available_providers = list_available_providers()
-        
-        # Создаем список доступных опций
-        llm_options = []
-        for p in available_providers:
-            if p['available']:
-                llm_options.append({
-                    'type': p['type'],
-                    'name': f"{p['name']} ({p['model']})"
-                })
-        
-        if not llm_options:
-            st.error("❌ Ни один LLM провайдер не доступен!")
-            st.info(
-                "**Как настроить:**\n\n"
-                "- **Ollama**: запустите `ollama serve`\n"
-                "- **Groq**: добавьте API ключ в `config.local.toml` или переменную окружения `GROQ_API_KEY`\n\n"
-                "Получить ключ Groq бесплатно: https://console.groq.com/keys"
-            )
-            st.stop()
-        
-        # Переключатель провайдеров
-        selected_index = 0
-        if 'selected_llm_type' in st.session_state:
-            for i, opt in enumerate(llm_options):
-                if opt['type'] == st.session_state['selected_llm_type']:
-                    selected_index = i
-                    break
-        
-        selected_provider = st.radio(
-            "Выберите LLM:",
-            options=range(len(llm_options)),
-            format_func=lambda i: llm_options[i]['name'],
-            index=selected_index,
-            help="Groq работает быстрее и не нагружает ваш ПК, но требует интернет. Ollama работает локально."
-        )
-        
-        st.session_state['selected_llm_type'] = llm_options[selected_index]['type']
-        
-        # Сброс провайдера при переключении
-        if 'llm_provider' in st.session_state:
-            del st.session_state['llm_provider']
-        
-        # Индикаторы статуса
-        st.divider()
-        st.subheader("Статус провайдеров:")
-        for p in available_providers:
-            status = "✅" if p['available'] else "❌"
-            st.write(f"{status} {p['name']}: `{p['model']}`")
-        
-        st.divider()
         st.header("Индекс документов")
         if index_ready():
             st.success("Индекс готов")
@@ -282,6 +154,37 @@ def main() -> None:
                 )
 
         st.divider()
+        
+        # ── Выбор LLM ───────────────────────────────────────────────────────
+        st.header("Источник LLM")
+        
+        llm_options = ["Ollama (локально)"]
+        if GROQ_AVAILABLE:
+            llm_options.append("Groq (облако)")
+        
+        selected_llm = st.radio(
+            "Выберите модель:",
+            llm_options,
+            index=1 if (GROQ_AVAILABLE and is_groq_configured()) else 0,
+        )
+        
+        if "Groq" in selected_llm:
+            set_llm_source("groq")
+            groq_info = get_groq_model_info()
+            if groq_info["configured"]:
+                st.success(f"✅ Groq: {groq_info['model']}")
+            else:
+                st.error("❌ API ключ не настроен")
+                st.info(
+                    "1. Получи ключ: https://console.groq.com/keys\n"
+                    "2. Добавь в config.local.toml:\n"
+                    "```toml\n[groq]\napi_key = \"gsk_...\"\n```"
+                )
+        else:
+            set_llm_source("ollama")
+            st.caption(f"Модель: `{CONFIG['model']['llm']}`")
+
+        st.divider()
         st.header("Общие сведения")
         teacher = st.text_input("Преподаватель", "Иванов И.И.")
         specialty = st.text_input(
@@ -291,9 +194,6 @@ def main() -> None:
         group = st.text_input("Группа", "ОИСИР-21")
         course = st.number_input("Курс", min_value=1, max_value=4, value=2)
         students = st.number_input("Студентов в группе", min_value=1, max_value=60, value=25)
-
-        st.divider()
-        st.caption(f"Модель: `{CONFIG['model']['llm']}`")
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
     tab_one, tab_batch, tab_chat = st.tabs(["Один урок", "Пакетная генерация", "Чат с документами"])
@@ -354,7 +254,9 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
         st.warning("Сначала постройте индекс документов — кнопка в боковой панели.")
         return
 
-    if st.button("Сгенерировать карту", type="primary", use_container_width=True, disabled=False):
+    llm_source = get_llm_source()
+    
+    if st.button("Сгенерировать карту", type="primary", use_container_width=True):
         st.session_state.pop("single_bytes", None)
 
         params = make_params(
@@ -367,19 +269,37 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
         STAGE_LABELS = {
             "index":    "1/3 — Загружаю индекс...",
             "context":  "2/3 — Ищу контекст в документах...",
-            "generate": f"3/3 — {st.session_state.get('selected_llm_type', 'LLM')} генерирует карту...",
+            "generate": f"3/3 — {'Groq' if llm_source == 'groq' else 'LLM'} генерирует карту...",
         }
 
         with st.status("Генерирую технологическую карту...", expanded=True) as status:
             stage_slot = st.empty()
-            
+            token_slot = st.empty()
+
+            def on_stage(name: str) -> None:
+                stage_slot.markdown(f"**{STAGE_LABELS.get(name, name)}**")
+                if name != "generate":
+                    token_slot.empty()
+
+            def on_token(count: int) -> None:
+                token_slot.caption(f"токенов: {count}")
+
             try:
-                # Получаем провайдер и генерируем карту
-                provider = get_provider_for_session()
-                stage_slot.markdown(f"**Используется: {provider.name}**")
+                # Поиск контекста (RAG)
+                from generator import load_index, retrieve_context, _lesson_search_queries
                 
-                card = generate_lesson_card_with_provider(params, provider=provider)
+                db, bm25_data = load_index()
+                queries = _lesson_search_queries(params["discipline"], params["specialty"])
+                context = retrieve_context(db, bm25_data, queries)
+                
+                # Генерация через выбранный источник
+                if llm_source == "groq" and GROQ_AVAILABLE:
+                    card = generate_with_groq(params, context, on_token=on_token)
+                else:
+                    card = generate_lesson_card(params, on_token=on_token, on_stage=lambda x: None)
+                
                 stage_slot.markdown("**Рендерю DOCX...**")
+                token_slot.empty()
                 render_docx(card, out_path)
                 with open(out_path, "rb") as f:
                     st.session_state["single_bytes"] = f.read()
@@ -473,6 +393,8 @@ def _tab_batch(teacher, specialty, course, group, students) -> None:
         st.warning("Сначала постройте индекс документов — кнопка в боковой панели.")
         return
 
+    llm_source = get_llm_source()
+
     if st.button(
         "Сгенерировать все",
         type="primary",
@@ -485,6 +407,11 @@ def _tab_batch(teacher, specialty, course, group, students) -> None:
         progress = st.progress(0.0, text="Начинаю генерацию...")
         log_slot = st.empty()
 
+        # Импорты для генерации
+        from generator import load_index, retrieve_context, _lesson_search_queries, render_docx
+        
+        db, bm25_data = load_index()
+
         for i, topic in enumerate(topics):
             n = start_num + i
             d = start_date + timedelta(days=i * date_step)
@@ -495,7 +422,16 @@ def _tab_batch(teacher, specialty, course, group, students) -> None:
                 topic, n, d, teacher, lesson_type, lesson_kind, duration,
             )
             try:
-                card = generate_lesson_card(params)
+                # Поиск контекста
+                queries = _lesson_search_queries(params["discipline"], params["specialty"])
+                context = retrieve_context(db, bm25_data, queries)
+                
+                # Генерация
+                if llm_source == "groq" and GROQ_AVAILABLE:
+                    card = generate_with_groq(params, context)
+                else:
+                    card = generate_lesson_card(params)
+                
                 fname = docx_filename(n, discipline)
                 out_path = OUTPUT_DIR / fname
                 render_docx(card, out_path)
@@ -532,10 +468,10 @@ def _tab_batch(teacher, specialty, course, group, students) -> None:
 # ─── Вкладка: чат с документами ──────────────────────────────────────────────
 
 def _tab_chat() -> None:
-    st.subheader("💬 Чат с документами")
+    st.subheader("Чат с документами")
     st.caption(
         "Задавай вопросы по учебным программам, компетенциям, требованиям ФГОС — "
-        "без генерации файлов. Ответы генерируются на основе ваших документов."
+        "без генерации файлов."
     )
 
     if not index_ready():
@@ -560,42 +496,32 @@ def _tab_chat() -> None:
             st.markdown(question)
         st.session_state["chat_history"].append({"role": "user", "content": question})
 
-        # Стримим ответ с эффектом печатной машинки
+        # Стримим ответ
         with st.chat_message("assistant"):
+            llm_source = get_llm_source()
+            
             try:
-                provider = get_provider_for_session()
-                response = st.write_stream(
-                    stream_chat_response_with_provider(question, provider=provider)
-                )
+                if llm_source == "groq" and GROQ_AVAILABLE:
+                    from groq_client import stream_chat_with_groq
+                    from generator import load_index, retrieve_context
+                    
+                    db, bm25_data = load_index()
+                    context = retrieve_context(db, bm25_data, question, k=15)
+                    
+                    response = st.write_stream(stream_chat_with_groq(question, context))
+                else:
+                    response = st.write_stream(stream_chat_response(question))
             except Exception as e:
                 response = f"Ошибка: {e}"
                 st.error(response)
 
         st.session_state["chat_history"].append({"role": "assistant", "content": response})
 
-    # Кнопки управления историей
+    # Кнопка очистки истории
     if st.session_state["chat_history"]:
-        col1, col2 = st.columns([1, 4])
-        with col1:
-            if st.button("🗑️ Очистить", type="secondary", key="clear_chat"):
-                st.session_state["chat_history"] = []
-                st.rerun()
-        with col2:
-            # Экспорт истории
-            import json
-            from datetime import datetime
-            export_data = {
-                "chat_history": st.session_state["chat_history"],
-                "export_date": datetime.now().isoformat(),
-                "llm_provider": st.session_state.get('selected_llm_type', 'unknown')
-            }
-            st.download_button(
-                label="📥 Скачать JSON",
-                data=json.dumps(export_data, ensure_ascii=False, indent=2),
-                file_name=f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
-                mime="application/json",
-                use_container_width=True
-            )
+        if st.button("Очистить историю", type="secondary"):
+            st.session_state["chat_history"] = []
+            st.rerun()
 
 
 if __name__ == "__main__":

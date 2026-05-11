@@ -1,0 +1,19 @@
+# Пример конфигурации Groq API
+# Скопируй этот файл в config.local.toml и раскомментируй настройки
+
+[groq]
+# Получи API ключ бесплатно: https://console.groq.com/keys
+api_key = "gsk_..."  # Вставь свой ключ
+
+# Доступные модели (бесплатно):
+# - llama-3.1-8b-instant (быстрая, 8B параметров)
+# - llama-3.1-70b-versatile (качественная, 70B параметров)
+# - mixtral-8x7b-32768 (Mixtral 8x7B)
+# - gemma-7b-it (Gemma 2 9B)
+model = "llama-3.1-8b-instant"
+
+# Лимиты бесплатного тарифа (на момент написания):
+# - Llama 3.1 8B: ~30 запросов в минуту
+# - Llama 3.1 70B: ~15 запросов в минуту
+# - Mixtral 8x7B: ~15 запросов в минуту
+# Актуальные лимиты: https://console.groq.com/docs/rate-limits
