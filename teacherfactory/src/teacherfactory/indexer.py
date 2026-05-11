@@ -90,8 +90,12 @@ def _load_pdf(pdf_path: Path) -> list[Document]:
 def _load_pdf_fallback(pdf_path: Path) -> list[Document]:
     """Запасной вариант — PyPDF (хуже обрабатывает таблицы)."""
     from langchain_community.document_loaders import PyPDFLoader
-    loader = PyPDFLoader(str(pdf_path))
-    return loader.load()
+    try:
+        loader = PyPDFLoader(str(pdf_path))
+        return loader.load()
+    except Exception as e:
+        log.error("PyPDF fallback failed for %s: %s", pdf_path.name, e)
+        return []
 
 
 def _load_docx(docx_path: Path) -> list[Document]:
