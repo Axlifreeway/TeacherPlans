@@ -1,22 +1,16 @@
 """
-Единый интерфейс для работы с различными LLM-провайдерами.
+Единый интерфейс для LLM-провайдеров.
 
 Поддерживает:
 - Ollama (локально)
-- Groq (облако, бесплатно)
-
-Безопасность:
-- API ключи через переменные окружения
-- Валидация конфигурации
-- Изоляция провайдеров
+- Groq (облако, бесплатный тариф)
 
 Использование:
     from llm_provider import get_llm_provider, LLMProviderType
-    
-    provider = get_llm_provider()  # автовыбор по конфигурации
-    response = provider.generate("вопрос", system_prompt="...")
-    
-    # или потоково
+
+    provider = get_llm_provider()                # автовыбор по конфигурации
+    text = provider.generate("вопрос", system_prompt="...")
+
     for chunk in provider.stream_chat(messages):
         print(chunk, end="")
 """
@@ -26,334 +20,229 @@ import os
 from abc import ABC, abstractmethod
 from collections.abc import Generator
 from enum import Enum
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel, Field, ValidationError
+from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
+from pydantic import BaseModel, ValidationError
 
-logger = logging.getLogger(__name__)
+from config import CONFIG
+
+log = logging.getLogger(__name__)
 
 
 class LLMProviderType(str, Enum):
-    """Типы поддерживаемых LLM-провайдеров."""
     OLLAMA = "ollama"
     GROQ = "groq"
 
 
 class ProviderConfig(BaseModel):
-    """Конфигурация провайдера."""
     provider_type: LLMProviderType
     model_name: str
-    api_key: Optional[str] = None
-    base_url: Optional[str] = None
+    api_key: str | None = None
+    base_url: str | None = None
     temperature: float = 0.7
-    max_retries: int = 3
-    timeout: int = 60
-    
-    class Config:
-        use_enum_values = True
+    num_gpu: int = 0
+    keep_alive: str = "10m"
+
+    model_config = {"use_enum_values": True, "protected_namespaces": ()}
 
 
 class LLMProvider(ABC):
-    """Абстрактный базовый класс для LLM-провайдеров."""
-    
     def __init__(self, config: ProviderConfig):
         self.config = config
-        self._client = None
-    
+        self._client: Any = None
+
     @property
     @abstractmethod
-    def name(self) -> str:
-        """Название провайдера."""
-        pass
-    
+    def name(self) -> str: ...
+
     @abstractmethod
-    def _create_client(self) -> Any:
-        """Создание клиента API."""
-        pass
-    
+    def _create_client(self) -> Any: ...
+
     @abstractmethod
-    def generate(self, prompt: str, system_prompt: str = "") -> str:
-        """Генерация текста."""
-        pass
-    
-    @abstractmethod
-    def stream_chat(
-        self, 
-        messages: List[Dict[str, str]], 
-        system_prompt: str = ""
-    ) -> Generator[str, None, None]:
-        """Потоковый чат."""
-        pass
-    
-    @abstractmethod
-    def is_available(self) -> bool:
-        """Проверка доступности провайдера."""
-        pass
-    
-    def _get_client(self) -> Any:
-        """Ленивая инициализация клиента."""
+    def is_available(self) -> bool: ...
+
+    def get_client(self) -> Any:
+        """Ленивая инициализация клиента LangChain."""
         if self._client is None:
             self._client = self._create_client()
         return self._client
 
-
-class OllamaProvider(LLMProvider):
-    """Провайдер для локальной Ollama."""
-    
-    @property
-    def name(self) -> str:
-        return "Ollama"
-    
-    def _create_client(self) -> Any:
-        from langchain_ollama import ChatOllama
-        
-        return ChatOllama(
-            model=self.config.model_name,
-            temperature=self.config.temperature,
-            num_gpu=-1 if os.name == 'nt' else 0,  # Адаптация под ОС
-            keep_alive="10m",
-        )
-    
     def generate(self, prompt: str, system_prompt: str = "") -> str:
-        client = self._get_client()
-        
-        messages = []
+        messages: list[Any] = []
         if system_prompt:
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=prompt))
-        
-        response = client.invoke(messages)
+        response = self.get_client().invoke(messages)
         return response.content
-    
+
     def stream_chat(
-        self, 
-        messages: List[Dict[str, str]], 
-        system_prompt: str = ""
+        self,
+        messages: list[dict[str, str]],
+        system_prompt: str = "",
     ) -> Generator[str, None, None]:
-        client = self._get_client()
-        
-        chat_messages = []
+        chat_messages: list[Any] = []
         if system_prompt:
             chat_messages.append(SystemMessage(content=system_prompt))
-        
+
         for msg in messages:
-            role = msg.get('role', 'user')
-            content = msg.get('content', '')
-            
-            if role == 'user':
+            role = msg.get("role", "user")
+            content = msg.get("content", "")
+            if role == "assistant":
+                chat_messages.append(AIMessage(content=content))
+            elif role == "system":
+                chat_messages.append(SystemMessage(content=content))
+            else:
                 chat_messages.append(HumanMessage(content=content))
-            elif role == 'assistant':
-                chat_messages.append(HumanMessage(content=content))
-        
-        stream = client.stream(chat_messages)
-        for chunk in stream:
-            yield chunk.content
-    
+
+        for chunk in self.get_client().stream(chat_messages):
+            yield getattr(chunk, "content", str(chunk))
+
+
+class OllamaProvider(LLMProvider):
+    @property
+    def name(self) -> str:
+        return "Ollama"
+
+    def _create_client(self) -> Any:
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            model=self.config.model_name,
+            temperature=self.config.temperature,
+            num_gpu=self.config.num_gpu,
+            keep_alive=self.config.keep_alive,
+        )
+
     def is_available(self) -> bool:
-        """Проверка доступности Ollama."""
         try:
             import requests
-            response = requests.get("http://localhost:11434/api/tags", timeout=5)
+
+            response = requests.get("http://localhost:11434/api/tags", timeout=2)
             return response.status_code == 200
         except Exception:
             return False
 
 
 class GroqProvider(LLMProvider):
-    """Провайдер для облачного Groq API."""
-    
     @property
     def name(self) -> str:
         return "Groq"
-    
+
     def _create_client(self) -> Any:
         from langchain_groq import ChatGroq
-        
+
         if not self.config.api_key:
             raise ValueError("Groq API ключ не настроен")
-        
+
         return ChatGroq(
             api_key=self.config.api_key,
             model_name=self.config.model_name,
             temperature=self.config.temperature,
             streaming=True,
         )
-    
-    def generate(self, prompt: str, system_prompt: str = "") -> str:
-        client = self._get_client()
-        
-        messages = []
-        if system_prompt:
-            messages.append(SystemMessage(content=system_prompt))
-        messages.append(HumanMessage(content=prompt))
-        
-        response = client.invoke(messages)
-        return response.content
-    
-    def stream_chat(
-        self, 
-        messages: List[Dict[str, str]], 
-        system_prompt: str = ""
-    ) -> Generator[str, None, None]:
-        client = self._get_client()
-        
-        chat_messages = []
-        if system_prompt:
-            chat_messages.append(SystemMessage(content=system_prompt))
-        
-        for msg in messages:
-            role = msg.get('role', 'user')
-            content = msg.get('content', '')
-            
-            if role == 'user':
-                chat_messages.append(HumanMessage(content=content))
-            elif role == 'assistant':
-                chat_messages.append(HumanMessage(content=content))
-        
-        stream = client.stream(chat_messages)
-        for chunk in stream:
-            if hasattr(chunk, 'content'):
-                yield chunk.content
-            else:
-                yield str(chunk)
-    
+
     def is_available(self) -> bool:
-        """Проверка наличия API ключа."""
         return bool(self.config.api_key)
 
 
-def create_provider_config(
+# ─── Фабрика ──────────────────────────────────────────────────────────────────
+
+def _groq_api_key(config_dict: dict) -> str | None:
+    """Берёт ключ Groq из конфига или переменной окружения."""
+    return config_dict.get("groq", {}).get("api_key") or os.getenv("GROQ_API_KEY")
+
+
+def _make_config(
     provider_type: LLMProviderType,
-    model_name: str,
-    api_key: Optional[str] = None,
-    temperature: float = 0.7,
+    config_dict: dict,
+    temperature: float | None = None,
 ) -> ProviderConfig:
-    """Создание конфигурации провайдера с валидацией."""
+    model_cfg = config_dict["model"]
+    temp = temperature if temperature is not None else model_cfg.get("temperature", 0.1)
+
     try:
+        if provider_type == LLMProviderType.GROQ:
+            groq_cfg = config_dict.get("groq", {})
+            return ProviderConfig(
+                provider_type=LLMProviderType.GROQ,
+                model_name=groq_cfg.get("model", "llama-3.1-8b-instant"),
+                api_key=_groq_api_key(config_dict),
+                temperature=temp,
+            )
         return ProviderConfig(
-            provider_type=provider_type.value if isinstance(provider_type, LLMProviderType) else provider_type,
-            model_name=model_name,
-            api_key=api_key,
-            temperature=temperature,
+            provider_type=LLMProviderType.OLLAMA,
+            model_name=model_cfg["llm"],
+            temperature=temp,
+            num_gpu=model_cfg.get("num_gpu", 0),
+            keep_alive=model_cfg.get("keep_alive", "10m"),
         )
     except ValidationError as e:
-        logger.error(f"Ошибка валидации конфигурации: {e}")
+        log.error("Ошибка валидации конфигурации провайдера: %s", e)
         raise
 
 
 def get_llm_provider(
-    provider_type: Optional[LLMProviderType] = None,
-    config_dict: Optional[Dict] = None,
+    provider_type: LLMProviderType | None = None,
+    temperature: float | None = None,
+    config_dict: dict | None = None,
 ) -> LLMProvider:
     """
-    Фабрика для получения LLM-провайдера.
-    
-    Args:
-        provider_type: Тип провайдера (автовыбор если None)
-        config_dict: Словарь конфигурации
-    
-    Returns:
-        Экземпляр LLMProvider
-    
-    Raises:
-        ValueError: Если ни один провайдер не доступен
+    Получить LLM-провайдер. Если provider_type=None, выбирается автоматически:
+    приоритет — Groq (если задан api_key), иначе Ollama.
     """
-    from .config import CONFIG
-    
-    if config_dict is None:
-        config_dict = CONFIG
-    
-    # Автоопределение провайдера
+    cfg = config_dict if config_dict is not None else CONFIG
+
     if provider_type is None:
-        # Проверяем Groq
-        groq_config = config_dict.get("groq", {})
-        if groq_config.get("api_key"):
+        if _groq_api_key(cfg):
             provider_type = LLMProviderType.GROQ
-            logger.info("Автовыбран провайдер: Groq")
-        # Проверяем Ollama
-        elif OllamaProvider(
-            create_provider_config(
-                LLMProviderType.OLLAMA,
-                config_dict["model"]["llm"]
-            )
-        ).is_available():
-            provider_type = LLMProviderType.OLLAMA
-            logger.info("Автовыбран провайдер: Ollama")
         else:
-            raise ValueError(
-                "Ни один LLM-провайдер не доступен!\n"
-                "- Для Groq: добавьте api_key в config.local.toml\n"
-                "- Для Ollama: запустите ollama serve"
-            )
-    
-    # Создание провайдера
+            ollama = OllamaProvider(_make_config(LLMProviderType.OLLAMA, cfg))
+            if ollama.is_available():
+                provider_type = LLMProviderType.OLLAMA
+            else:
+                raise ValueError(
+                    "Ни один LLM-провайдер не доступен:\n"
+                    "  - для Groq добавьте api_key в config.local.toml или "
+                    "переменную GROQ_API_KEY;\n"
+                    "  - для Ollama запустите `ollama serve`."
+                )
+
+    config = _make_config(provider_type, cfg, temperature=temperature)
     if provider_type == LLMProviderType.GROQ:
-        groq_config = config_dict.get("groq", {})
-        api_key = groq_config.get("api_key") or os.getenv("GROQ_API_KEY")
-        
-        if not api_key:
-            raise ValueError("Groq API ключ не настроен!")
-        
-        config = create_provider_config(
-            LLMProviderType.GROQ,
-            groq_config.get("model", "llama-3.1-8b-instant"),
-            api_key=api_key,
-            temperature=config_dict["model"].get("chat_temperature", 0.7),
-        )
+        if not config.api_key:
+            raise ValueError("Groq API ключ не настроен")
         return GroqProvider(config)
-    
-    elif provider_type == LLMProviderType.OLLAMA:
-        config = create_provider_config(
-            LLMProviderType.OLLAMA,
-            config_dict["model"]["llm"],
-            temperature=config_dict["model"].get("chat_temperature", 0.7),
-        )
-        return OllamaProvider(config)
-    
-    else:
-        raise ValueError(f"Неподдерживаемый тип провайдера: {provider_type}")
+    return OllamaProvider(config)
 
 
-def list_available_providers(config_dict: Optional[Dict] = None) -> List[Dict[str, Any]]:
-    """
-    Получить список доступных провайдеров.
-    
-    Returns:
-        Список словарей: [{'name': str, 'type': str, 'available': bool, 'model': str}]
-    """
-    from .config import CONFIG
-    
-    if config_dict is None:
-        config_dict = CONFIG
-    
-    providers = []
-    
-    # Ollama
-    ollama_model = config_dict["model"]["llm"]
+def list_available_providers(config_dict: dict | None = None) -> list[dict[str, Any]]:
+    """Список провайдеров для отображения в UI."""
+    cfg = config_dict if config_dict is not None else CONFIG
+
+    ollama_model = cfg["model"]["llm"]
     ollama_available = OllamaProvider(
-        create_provider_config(LLMProviderType.OLLAMA, ollama_model)
+        _make_config(LLMProviderType.OLLAMA, cfg)
     ).is_available()
-    providers.append({
-        "name": "Ollama",
-        "type": LLMProviderType.OLLAMA.value,
-        "available": ollama_available,
-        "model": ollama_model,
-    })
-    
-    # Groq
-    groq_config = config_dict.get("groq", {})
-    groq_api_key = groq_config.get("api_key") or os.getenv("GROQ_API_KEY")
-    groq_model = groq_config.get("model", "llama-3.1-8b-instant")
-    groq_available = bool(groq_api_key)
-    providers.append({
-        "name": "Groq",
-        "type": LLMProviderType.GROQ.value,
-        "available": groq_available,
-        "model": groq_model,
-    })
-    
-    return providers
+
+    groq_cfg = cfg.get("groq", {})
+    groq_model = groq_cfg.get("model", "llama-3.1-8b-instant")
+    groq_available = bool(_groq_api_key(cfg))
+
+    return [
+        {
+            "name": "Ollama",
+            "type": LLMProviderType.OLLAMA.value,
+            "available": ollama_available,
+            "model": ollama_model,
+        },
+        {
+            "name": "Groq",
+            "type": LLMProviderType.GROQ.value,
+            "available": groq_available,
+            "model": groq_model,
+        },
+    ]
 
 
 __all__ = [
@@ -364,5 +253,4 @@ __all__ = [
     "GroqProvider",
     "get_llm_provider",
     "list_available_providers",
-    "create_provider_config",
 ]

@@ -2,20 +2,14 @@
 Streamlit-интерфейс TeacherFactory.
 
 Запуск: poetry run streamlit run src/teacherfactory/app.py
-
-Улучшения UX:
-- Переключатель LLM провайдеров в реальном времени
-- Стриминг ответов с эффектом "печатной машинки"
-- Индикаторы статуса провайдеров
-- Сохранение истории чата между сессиями
-- Кнопки быстрых действий
-- Блокировка интерфейса во время генерации
 """
 
 import io
+import json
 import sys
+import traceback
 import zipfile
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 import streamlit as st
@@ -23,15 +17,19 @@ import streamlit as st
 sys.path.insert(0, str(Path(__file__).parent))
 
 from config import CONFIG  # noqa: E402
+from embeddings import describe_embeddings  # noqa: E402
 from generator import (  # noqa: E402
+    COMPETENCY_RE,
+    generate_lesson_card,
     render_docx,
+    stream_chat_response,
     validate_competencies,
 )
-from indexer import INDEX_DIR, build_index, DOCS_DIR  # noqa: E402
+from indexer import INDEX_DIR, build_index  # noqa: E402
 from llm_provider import (  # noqa: E402
+    LLMProviderType,
     get_llm_provider,
     list_available_providers,
-    LLMProviderType,
 )
 
 OUTPUT_DIR = Path.home() / ".teacherfactory" / "output"
@@ -60,95 +58,51 @@ def index_ready() -> bool:
     return INDEX_DIR.exists() and any(INDEX_DIR.iterdir())
 
 
-def get_provider_for_session():
-    """Получить LLM провайдер из сессии или создать новый."""
-    if 'llm_provider' not in st.session_state:
-        try:
-            # Получаем выбранный тип провайдера
-            selected_type = st.session_state.get('selected_llm_type')
-            if selected_type:
-                provider_type = LLMProviderType(selected_type)
-                st.session_state['llm_provider'] = get_llm_provider(provider_type=provider_type)
-            else:
-                st.session_state['llm_provider'] = get_llm_provider()
-        except ValueError as e:
-            st.error(f"Ошибка инициализации LLM: {e}")
-            return None
-    return st.session_state['llm_provider']
+def get_provider_for_session(temperature: float | None = None):
+    """Получить LLM-провайдер по выбору пользователя в sidebar."""
+    selected_type = st.session_state.get("selected_llm_type")
+    provider_type = LLMProviderType(selected_type) if selected_type else None
+    return get_llm_provider(provider_type=provider_type, temperature=temperature)
 
 
-def generate_lesson_card_with_provider(params: dict, provider=None):
-    """Генерация карты урока через выбранный провайдер."""
-    from generator import (
-        SYSTEM_PROMPT, USER_PROMPT, 
-        retrieve_context, load_index, _lesson_search_queries
+def _format_exception(e: BaseException) -> str:
+    """Человекочитаемое описание ошибки (некоторые исключения LangChain имеют пустой str())."""
+    msg = str(e).strip()
+    return f"{type(e).__name__}: {msg}" if msg else type(e).__name__
+
+
+def _is_rate_limit(exc: BaseException) -> bool:
+    name = type(exc).__name__
+    msg = str(exc).lower()
+    return (
+        "rate_limit" in msg
+        or "rate limit" in msg
+        or "tokens per minute" in msg
+        or "tpm" in msg
+        or getattr(exc, "status_code", None) in (413, 429)
+        or "RateLimit" in name
     )
-    from langchain_core.prompts import ChatPromptTemplate
-    
-    if provider is None:
-        provider = get_provider_for_session()
-    
-    db, bm25_data = load_index()
-    queries = _lesson_search_queries(params["discipline"], params["specialty"])
-    context = retrieve_context(db, bm25_data, queries)
-    
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", SYSTEM_PROMPT),
-        ("human", USER_PROMPT),
-    ])
-    
-    chain = prompt | provider._get_client().with_structured_output(
-        __import__('model', fromlist=['LessonCard']).LessonCard
-    )
-    
-    result = chain.invoke({"context": context, **params})
-    return result
 
 
-def stream_chat_response_with_provider(question: str, provider=None):
-    """Потоковый чат через выбранный провайдер."""
-    from generator import (
-        CHAT_SYSTEM_PROMPT, HYDE_PROMPT,
-        retrieve_context, load_index,
-        _LIST_INTENT_RE, _SPECIALTY_CODE_RE,
-        _retrieve_by_specialty
-    )
-    from langchain_core.prompts import ChatPromptTemplate
-    
-    if provider is None:
-        provider = get_provider_for_session()
-    
-    db, bm25_data = load_index()
-    
-    is_list_query = bool(_LIST_INTENT_RE.search(question))
-    specialty_match = _SPECIALTY_CODE_RE.search(question)
-    
-    if specialty_match and bm25_data:
-        context = _retrieve_by_specialty(
-            bm25_data,
-            specialty_match.group(),
-            extra_query=question,
-            db=db,
+def _show_error(prefix: str, exc: BaseException) -> None:
+    if _is_rate_limit(exc):
+        st.error(
+            f"⏱️ Groq упёрся в лимит токенов в минуту (TPM). "
+            f"На бесплатном тарифе у `llama-3.3-70b-versatile` лимит — 12k токенов/мин.\n\n"
+            f"Что можно сделать:\n"
+            f"- подождать минуту и повторить запрос;\n"
+            f"- переключиться на `llama-3.1-8b-instant` в `config.local.toml` "
+            f"(у неё лимит существенно выше);\n"
+            f"- уменьшить контекст: `chat_k` и `chat_specialty_k` в `[rag]` "
+            f"в `config.local.toml`."
         )
-    else:
-        chat_k = CONFIG["rag"].get("chat_k", 15)
-        effective_k = chat_k * 2 if is_list_query else chat_k
-        
-        search_query = question
-        if CONFIG["rag"].get("hyde_enabled", False):
-            try:
-                hyde_prompt = HYDE_PROMPT.format(question=question)
-                hypothetical = provider.generate(hyde_prompt)
-                search_query = [hypothetical, question]
-            except Exception as e:
-                pass
-        
-        context = retrieve_context(db, bm25_data, search_query, k=effective_k)
-    
-    messages = [{"role": "user", "content": f"Контекст:\n{context}\n\nВопрос: {question}"}]
-    
-    for chunk in provider.stream_chat(messages, system_prompt=CHAT_SYSTEM_PROMPT):
-        yield chunk
+        with st.expander("Ответ Groq"):
+            st.code(_format_exception(exc))
+        return
+
+    st.error(f"{prefix}: {_format_exception(exc)}")
+    with st.expander("Подробности (traceback)"):
+        st.code(traceback.format_exc())
 
 
 def make_params(
@@ -200,103 +154,12 @@ def main() -> None:
 
     # ── Sidebar ───────────────────────────────────────────────────────────────
     with st.sidebar:
-        st.header("🔧 Настройки LLM")
-        
-        # Получаем доступные провайдеры
-        available_providers = list_available_providers()
-        
-        # Создаем список доступных опций
-        llm_options = []
-        for p in available_providers:
-            if p['available']:
-                llm_options.append({
-                    'type': p['type'],
-                    'name': f"{p['name']} ({p['model']})"
-                })
-        
-        if not llm_options:
-            st.error("❌ Ни один LLM провайдер не доступен!")
-            st.info(
-                "**Как настроить:**\n\n"
-                "- **Ollama**: запустите `ollama serve`\n"
-                "- **Groq**: добавьте API ключ в `config.local.toml` или переменную окружения `GROQ_API_KEY`\n\n"
-                "Получить ключ Groq бесплатно: https://console.groq.com/keys"
-            )
-            st.stop()
-        
-        # Переключатель провайдеров
-        selected_index = 0
-        if 'selected_llm_type' in st.session_state:
-            for i, opt in enumerate(llm_options):
-                if opt['type'] == st.session_state['selected_llm_type']:
-                    selected_index = i
-                    break
-        
-        selected_provider = st.radio(
-            "Выберите LLM:",
-            options=range(len(llm_options)),
-            format_func=lambda i: llm_options[i]['name'],
-            index=selected_index,
-            help="Groq работает быстрее и не нагружает ваш ПК, но требует интернет. Ollama работает локально."
-        )
-        
-        st.session_state['selected_llm_type'] = llm_options[selected_index]['type']
-        
-        # Сброс провайдера при переключении
-        if 'llm_provider' in st.session_state:
-            del st.session_state['llm_provider']
-        
-        # Индикаторы статуса
-        st.divider()
-        st.subheader("Статус провайдеров:")
-        for p in available_providers:
-            status = "✅" if p['available'] else "❌"
-            st.write(f"{status} {p['name']}: `{p['model']}`")
-        
-        st.divider()
-        st.header("Индекс документов")
-        if index_ready():
-            st.success("Индекс готов")
-        else:
-            st.warning("Индекс не построен")
-
-        if st.button("Перестроить индекс", use_container_width=True):
-            with st.spinner("Индексирую PDF/DOCX из папки docs/..."):
-                try:
-                    build_index()
-                    st.success("Индекс построен!")
-                except Exception as e:
-                    st.error(f"Ошибка индексации: {e}")
-            st.rerun()
-
-        # Предупреждение о .doc файлах
-        skipped_path = INDEX_DIR / "skipped_doc_files.txt"
-        if skipped_path.exists():
-            skipped = skipped_path.read_text(encoding="utf-8").strip().splitlines()
-            if skipped:
-                st.warning(
-                    f"⚠️ {len(skipped)} файл(ов) **не проиндексированы** "
-                    f"(формат .doc не поддерживается):\n\n"
-                    + "\n".join(f"- `{f}`" for f in skipped)
-                    + "\n\nСконвертируй через Word → «Сохранить как .docx»."
-                )
-
-        st.divider()
-        st.header("Общие сведения")
-        teacher = st.text_input("Преподаватель", "Иванов И.И.")
-        specialty = st.text_input(
-            "Специальность",
-            "09.01.03 Оператор информационных систем и ресурсов",
-        )
-        group = st.text_input("Группа", "ОИСИР-21")
-        course = st.number_input("Курс", min_value=1, max_value=4, value=2)
-        students = st.number_input("Студентов в группе", min_value=1, max_value=60, value=25)
-
-        st.divider()
-        st.caption(f"Модель: `{CONFIG['model']['llm']}`")
+        teacher, specialty, course, group, students = _sidebar()
 
     # ── Tabs ──────────────────────────────────────────────────────────────────
-    tab_one, tab_batch, tab_chat = st.tabs(["Один урок", "Пакетная генерация", "Чат с документами"])
+    tab_one, tab_batch, tab_chat = st.tabs(
+        ["Один урок", "Пакетная генерация", "Чат с документами"]
+    )
 
     with tab_one:
         _tab_single(teacher, specialty, course, group, students)
@@ -308,28 +171,134 @@ def main() -> None:
         _tab_chat()
 
 
+def _sidebar() -> tuple[str, str, int, str, int]:
+    """Боковая панель: выбор LLM, индекс, общие сведения."""
+    st.header("🔧 Настройки LLM")
+
+    providers = list_available_providers()
+    available = [p for p in providers if p["available"]]
+
+    if not available:
+        st.error("❌ Ни один LLM-провайдер не доступен.")
+        st.info(
+            "**Как настроить:**\n\n"
+            "- **Ollama**: запустите `ollama serve` и загрузите модель.\n"
+            "- **Groq**: добавьте API-ключ в `config.local.toml` "
+            "или в переменную окружения `GROQ_API_KEY`.\n\n"
+            "Бесплатный ключ Groq: https://console.groq.com/keys"
+        )
+        st.stop()
+
+    current_type = st.session_state.get("selected_llm_type")
+    default_idx = next(
+        (i for i, p in enumerate(available) if p["type"] == current_type),
+        0,
+    )
+
+    selected_idx = st.radio(
+        "Провайдер:",
+        options=range(len(available)),
+        format_func=lambda i: f"{available[i]['name']} ({available[i]['model']})",
+        index=default_idx,
+        help="Groq — быстро, требует интернет. Ollama — локально, приватно.",
+    )
+
+    new_type = available[selected_idx]["type"]
+    if new_type != current_type:
+        st.session_state["selected_llm_type"] = new_type
+
+    st.divider()
+    st.subheader("Статус провайдеров")
+    for p in providers:
+        icon = "✅" if p["available"] else "❌"
+        st.write(f"{icon} {p['name']}: `{p['model']}`")
+
+    st.divider()
+    st.header("Индекс документов")
+    if index_ready():
+        st.success("Индекс готов")
+    else:
+        st.warning("Индекс не построен")
+
+    st.caption(f"Эмбеддинги: `{describe_embeddings()}`")
+    st.caption(
+        "При смене embeddings.provider в config.local.toml — обязательно "
+        "перестрой индекс."
+    )
+
+    if st.button("Перестроить индекс", use_container_width=True):
+        st.session_state.pop("last_index_build", None)
+        with st.spinner("Индексирую PDF/DOCX из папки docs/..."):
+            try:
+                stats = build_index()
+                st.session_state["last_index_build"] = {"ok": True, "stats": stats}
+            except Exception as e:
+                st.session_state["last_index_build"] = {
+                    "ok": False,
+                    "error": _format_exception(e),
+                    "traceback": traceback.format_exc(),
+                }
+
+    last = st.session_state.get("last_index_build")
+    if last:
+        if last["ok"]:
+            stats = last["stats"]
+            st.success(
+                f"✅ Индекс построен: {stats['chunks']} чанков из "
+                f"{stats['documents']} документов "
+                f"({stats['embeddings']}, dim={stats['dim']})."
+            )
+            if stats["skipped_doc"]:
+                st.warning(
+                    f"⚠️ Пропущено {len(stats['skipped_doc'])} .doc файлов "
+                    f"(нужна конвертация в .docx): "
+                    + ", ".join(f"`{f}`" for f in stats["skipped_doc"])
+                )
+        else:
+            st.error(f"❌ Ошибка индексации: {last['error']}")
+            with st.expander("Подробности (traceback)"):
+                st.code(last["traceback"])
+
+    skipped_path = INDEX_DIR / "skipped_doc_files.txt"
+    if skipped_path.exists():
+        skipped = skipped_path.read_text(encoding="utf-8").strip().splitlines()
+        if skipped:
+            st.warning(
+                f"⚠️ {len(skipped)} файл(ов) **не проиндексированы** "
+                f"(формат .doc не поддерживается):\n\n"
+                + "\n".join(f"- `{f}`" for f in skipped)
+                + "\n\nСконвертируй через Word → «Сохранить как .docx»."
+            )
+
+    st.divider()
+    st.header("Общие сведения")
+    teacher = st.text_input("Преподаватель", "Иванов И.И.")
+    specialty = st.text_input(
+        "Специальность",
+        "09.01.03 Оператор информационных систем и ресурсов",
+    )
+    group = st.text_input("Группа", "ОИСИР-21")
+    course = st.number_input("Курс", min_value=1, max_value=4, value=2)
+    students = st.number_input("Студентов в группе", min_value=1, max_value=60, value=25)
+
+    return teacher, specialty, course, group, students
+
+
 # ─── Helpers для предпросмотра ────────────────────────────────────────────────
 
 def _render_competencies(text: str, validation: dict[str, bool]) -> None:
     """Выводит текст компетенций, подсвечивая непроверенные коды."""
-    import re
-    from generator import COMPETENCY_RE
-
     if not text or text.strip() == "Не указано в документах":
         st.markdown(f"*{text}*")
         return
 
-    lines = text.strip().splitlines()
-    for line in lines:
+    for line in text.strip().splitlines():
         codes_in_line = COMPETENCY_RE.findall(line)
-        if codes_in_line:
-            unverified = [c for c in codes_in_line if validation.get(c) is False]
-            if unverified:
-                st.markdown(f"⚠️ {line}")
-            else:
-                st.markdown(f"✅ {line}")
-        else:
+        if not codes_in_line:
             st.markdown(line)
+            continue
+        unverified = [c for c in codes_in_line if validation.get(c) is False]
+        st.markdown(f"{'⚠️' if unverified else '✅'} {line}")
 
 
 # ─── Вкладка: один урок ───────────────────────────────────────────────────────
@@ -354,7 +323,7 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
         st.warning("Сначала постройте индекс документов — кнопка в боковой панели.")
         return
 
-    if st.button("Сгенерировать карту", type="primary", use_container_width=True, disabled=False):
+    if st.button("Сгенерировать карту", type="primary", use_container_width=True):
         st.session_state.pop("single_bytes", None)
 
         params = make_params(
@@ -364,25 +333,38 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
         fname = docx_filename(number, discipline)
         out_path = OUTPUT_DIR / fname
 
-        STAGE_LABELS = {
-            "index":    "1/3 — Загружаю индекс...",
-            "context":  "2/3 — Ищу контекст в документах...",
-            "generate": f"3/3 — {st.session_state.get('selected_llm_type', 'LLM')} генерирует карту...",
-        }
-
         with st.status("Генерирую технологическую карту...", expanded=True) as status:
             stage_slot = st.empty()
-            
+            token_slot = st.empty()
+
+            stage_labels = {
+                "index": "1/3 — Загружаю индекс...",
+                "context": "2/3 — Ищу контекст в документах...",
+                "generate": "3/3 — Генерирую карту...",
+            }
+
+            def on_stage(name: str) -> None:
+                stage_slot.markdown(f"**{stage_labels.get(name, name)}**")
+                if name != "generate":
+                    token_slot.empty()
+
+            def on_token(count: int) -> None:
+                token_slot.caption(f"токенов: {count}")
+
             try:
-                # Получаем провайдер и генерируем карту
-                provider = get_provider_for_session()
-                stage_slot.markdown(f"**Используется: {provider.name}**")
-                
-                card = generate_lesson_card_with_provider(params, provider=provider)
+                provider = get_provider_for_session(
+                    temperature=CONFIG["model"]["temperature"]
+                )
+                stage_slot.markdown(f"**Провайдер: {provider.name} ({provider.config.model_name})**")
+
+                card = generate_lesson_card(
+                    params, provider=provider, on_token=on_token, on_stage=on_stage,
+                )
                 stage_slot.markdown("**Рендерю DOCX...**")
+                token_slot.empty()
                 render_docx(card, out_path)
-                with open(out_path, "rb") as f:
-                    st.session_state["single_bytes"] = f.read()
+
+                st.session_state["single_bytes"] = out_path.read_bytes()
                 st.session_state["single_fname"] = fname
                 st.session_state["single_card"] = card
 
@@ -390,8 +372,8 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
                 st.session_state["validation"] = validate_competencies(card)
                 status.update(label="Готово!", state="complete")
             except Exception as e:
-                status.update(label=f"Ошибка: {e}", state="error")
-                st.error(str(e))
+                status.update(label=f"Ошибка: {_format_exception(e)}", state="error")
+                _show_error("Не удалось сгенерировать карту", e)
 
     if "single_bytes" in st.session_state:
         card = st.session_state["single_card"]
@@ -400,7 +382,6 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
 
         st.success(f"Карта готова: {card.lesson_topic}")
 
-        # Предупреждение о непроверенных компетенциях
         unverified = [c for c, found in validation.items() if not found]
         if unverified:
             st.warning(
@@ -411,7 +392,6 @@ def _tab_single(teacher, specialty, course, group, students) -> None:
         with st.expander("Предпросмотр"):
             st.markdown(f"**Цель:** {card.goal}")
 
-            # Компетенции с индикаторами валидации
             st.markdown("**Общие компетенции (ОК):**")
             _render_competencies(card.competencies_ok, validation)
             st.markdown("**Профессиональные компетенции (ПК):**")
@@ -485,6 +465,8 @@ def _tab_batch(teacher, specialty, course, group, students) -> None:
         progress = st.progress(0.0, text="Начинаю генерацию...")
         log_slot = st.empty()
 
+        provider = get_provider_for_session(temperature=CONFIG["model"]["temperature"])
+
         for i, topic in enumerate(topics):
             n = start_num + i
             d = start_date + timedelta(days=i * date_step)
@@ -495,14 +477,13 @@ def _tab_batch(teacher, specialty, course, group, students) -> None:
                 topic, n, d, teacher, lesson_type, lesson_kind, duration,
             )
             try:
-                card = generate_lesson_card(params)
+                card = generate_lesson_card(params, provider=provider)
                 fname = docx_filename(n, discipline)
                 out_path = OUTPUT_DIR / fname
                 render_docx(card, out_path)
-                with open(out_path, "rb") as f:
-                    docx_files[fname] = f.read()
+                docx_files[fname] = out_path.read_bytes()
             except Exception as e:
-                errors.append(f"Урок {n} «{topic}»: {e}")
+                errors.append(f"Урок {n} «{topic}»: {_format_exception(e)}")
 
             progress.progress((i + 1) / len(topics), text=f"{i + 1}/{len(topics)} готово")
 
@@ -542,38 +523,32 @@ def _tab_chat() -> None:
         st.warning("Сначала постройте индекс документов — кнопка в боковой панели.")
         return
 
-    # Инициализация истории чата
     if "chat_history" not in st.session_state:
         st.session_state["chat_history"] = []
 
-    # Отображаем историю
     for msg in st.session_state["chat_history"]:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
 
-    # Поле ввода
     question = st.chat_input("Спроси о программе, компетенциях, требованиях...")
 
     if question:
-        # Показываем вопрос
         with st.chat_message("user"):
             st.markdown(question)
         st.session_state["chat_history"].append({"role": "user", "content": question})
 
-        # Стримим ответ с эффектом печатной машинки
         with st.chat_message("assistant"):
             try:
-                provider = get_provider_for_session()
-                response = st.write_stream(
-                    stream_chat_response_with_provider(question, provider=provider)
+                provider = get_provider_for_session(
+                    temperature=CONFIG["model"]["chat_temperature"]
                 )
+                response = st.write_stream(stream_chat_response(question, provider=provider))
             except Exception as e:
-                response = f"Ошибка: {e}"
-                st.error(response)
+                response = f"Ошибка: {_format_exception(e)}"
+                _show_error("Не удалось получить ответ", e)
 
         st.session_state["chat_history"].append({"role": "assistant", "content": response})
 
-    # Кнопки управления историей
     if st.session_state["chat_history"]:
         col1, col2 = st.columns([1, 4])
         with col1:
@@ -581,20 +556,17 @@ def _tab_chat() -> None:
                 st.session_state["chat_history"] = []
                 st.rerun()
         with col2:
-            # Экспорт истории
-            import json
-            from datetime import datetime
             export_data = {
                 "chat_history": st.session_state["chat_history"],
                 "export_date": datetime.now().isoformat(),
-                "llm_provider": st.session_state.get('selected_llm_type', 'unknown')
+                "llm_provider": st.session_state.get("selected_llm_type", "unknown"),
             }
             st.download_button(
                 label="📥 Скачать JSON",
                 data=json.dumps(export_data, ensure_ascii=False, indent=2),
                 file_name=f"chat_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
                 mime="application/json",
-                use_container_width=True
+                use_container_width=True,
             )
 
 

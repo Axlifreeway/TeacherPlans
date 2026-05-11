@@ -14,11 +14,11 @@ from pathlib import Path
 
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
-from langchain_ollama import OllamaEmbeddings
 from langchain_text_splitters import RecursiveCharacterTextSplitter
 from rank_bm25 import BM25Okapi
 
 from config import CONFIG
+from embeddings import get_embeddings
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger(__name__)
@@ -135,9 +135,19 @@ def _load_docx(docx_path: Path) -> list[Document]:
     return []
 
 
-def build_index() -> None:
-    """Построить FAISS + BM25 индексы из PDF и DOCX в папке docs/."""
+def build_index() -> dict:
+    """
+    Построить FAISS + BM25 индексы из PDF и DOCX в папке docs/.
 
+    Возвращает словарь со статистикой:
+        {
+            "chunks": int,         # сколько чанков попало в индекс
+            "documents": int,      # сколько исходных PDF/DOCX
+            "skipped_doc": list,   # .doc файлы, пропущенные как неподдерживаемые
+            "embeddings": str,     # имя класса эмбеддингов
+            "dim": int,            # размерность вектора
+        }
+    """
     # 1. Загрузка документов
     all_docs: list[Document] = []
     skipped_doc: list[str] = []
@@ -147,8 +157,9 @@ def build_index() -> None:
     doc_files = sorted(DOCS_DIR.glob("*.doc"))
 
     if not pdf_files and not docx_files:
-        log.warning("Нет PDF/DOCX файлов в %s", DOCS_DIR)
-        return
+        raise FileNotFoundError(
+            f"В папке {DOCS_DIR} не найдено ни одного .pdf или .docx файла."
+        )
 
     for pdf_path in pdf_files:
         log.info("  PDF: %s", pdf_path.name)
@@ -179,8 +190,10 @@ def build_index() -> None:
     )
 
     if not all_docs:
-        log.error("Не удалось загрузить ни одного документа")
-        return
+        raise RuntimeError(
+            f"Не удалось извлечь текст ни из одного документа в {DOCS_DIR}. "
+            "Возможно, файлы повреждены или защищены."
+        )
 
     # 2. Структурный чанкинг — уважает границы строк и абзацев
     chunk_size = CONFIG["rag"]["chunk_size"]
@@ -196,9 +209,8 @@ def build_index() -> None:
     INDEX_DIR.mkdir(parents=True, exist_ok=True)
 
     # 3. FAISS (dense — семантический поиск)
-    embed_model = CONFIG["model"]["embeddings"]
-    log.info("Создаю эмбеддинги с моделью %s...", embed_model)
-    embeddings = OllamaEmbeddings(model=embed_model)
+    embeddings = get_embeddings()
+    log.info("Создаю эмбеддинги: %s", type(embeddings).__name__)
     db = FAISS.from_documents(chunks, embeddings)
     db.save_local(str(INDEX_DIR))
     log.info("FAISS-индекс сохранён в %s", INDEX_DIR)
@@ -226,6 +238,14 @@ def build_index() -> None:
             "[%d] %s (стр. %s): %s...",
             i, source, doc.metadata.get("page", "?"), doc.page_content[:150],
         )
+
+    return {
+        "chunks": len(chunks),
+        "documents": len(pdf_files) + len(docx_files),
+        "skipped_doc": skipped_doc,
+        "embeddings": type(embeddings).__name__,
+        "dim": db.index.d,
+    }
 
 
 if __name__ == "__main__":

@@ -11,6 +11,10 @@
 Для чата используется HyDE: перед поиском генерируется гипотетический
 ответ, что улучшает точность для разговорных запросов.
 
+LLM-провайдер выбирается через llm_provider.get_llm_provider() и может
+быть передан в функции явно (для UI с переключателем) или взят
+автоматически по конфигурации.
+
 Запуск: poetry run python src/teacherfactory/generator.py
 """
 
@@ -25,10 +29,11 @@ from langchain_core.callbacks.base import BaseCallbackHandler
 from langchain_community.vectorstores import FAISS
 from langchain_core.documents import Document
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_ollama import ChatOllama, OllamaEmbeddings
 from sentence_transformers import CrossEncoder
 
 from config import CONFIG
+from embeddings import get_embeddings
+from llm_provider import LLMProvider, get_llm_provider
 from model import LessonCard
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -42,6 +47,15 @@ OUTPUT_DIR = Path.home() / ".teacherfactory" / "output"
 
 # Паттерн для кодов компетенций: ОК 01, ПК 1.2, ОК01 и т.п.
 COMPETENCY_RE = re.compile(r'(?:ОК|ПК)\s*\d+(?:\.\d+)*')
+
+# Маркеры запросов типа "перечисли все ОК/ПК" или "какие дисциплины"
+_LIST_INTENT_RE = re.compile(
+    r'(перечисл|список|все\s+(?:ок|пк)|полн|все\s+компетенц|какие\s+дисципл|дисципл\w+\s+направл)',
+    re.IGNORECASE,
+)
+
+# Паттерн специальности: "09.01.03", "10.02.05" и т.п.
+_SPECIALTY_CODE_RE = re.compile(r'\d{2}\.\d{2}\.\d{2}')
 
 
 # ─── Промпты ──────────────────────────────────────────────────────────────────
@@ -156,14 +170,14 @@ def _tokenize(text: str) -> list[str]:
     return text.lower().split()
 
 
-# Маркеры запросов типа "перечисли все ОК/ПК" или "какие дисциплины"
-_LIST_INTENT_RE = re.compile(
-    r'(перечисл|список|все\s+(?:ок|пк)|полн|все\s+компетенц|какие\s+дисципл|дисципл\w+\s+направл)',
-    re.IGNORECASE,
-)
-
-# Паттерн специальности: "09.01.03", "10.02.05" и т.п.
-_SPECIALTY_CODE_RE = re.compile(r'\d{2}\.\d{2}\.\d{2}')
+def _lesson_search_queries(discipline: str, specialty: str) -> list[str]:
+    """Несколько вариантов запроса для лучшего покрытия документа."""
+    return [
+        f"{discipline} {specialty} компетенции знания умения навыки",
+        f"профессиональные компетенции ПК {discipline}",
+        f"общие компетенции ОК {specialty}",
+        f"{discipline} результаты освоения рабочая программа",
+    ]
 
 
 def _retrieve_by_specialty(
@@ -171,13 +185,15 @@ def _retrieve_by_specialty(
     specialty_code: str,
     extra_query: str,
     db: "FAISS",
-    k: int = 50,
+    k: int | None = None,
 ) -> str:
     """
     Для запросов типа "перечисли дисциплины 09.01.03" —
     возвращает ВСЕ чанки из файлов, в чьём имени есть код специальности.
     Дополняем семантическим поиском по всем документам для надёжности.
     """
+    if k is None:
+        k = CONFIG["rag"].get("chat_specialty_k", 20)
     code_norm = specialty_code.replace(".", "")
     matching: list[Document] = []
 
@@ -210,28 +226,6 @@ def _retrieve_by_specialty(
     return "\n\n---\n\n".join(context_parts)
 
 
-def _make_llm(temperature: float | None = None, streaming: bool = False,
-              callbacks: list | None = None) -> ChatOllama:
-    return ChatOllama(
-        model=CONFIG["model"]["llm"],
-        temperature=temperature if temperature is not None else CONFIG["model"]["temperature"],
-        num_gpu=CONFIG["model"]["num_gpu"],
-        keep_alive=CONFIG["model"].get("keep_alive", "5m"),
-        streaming=streaming,
-        callbacks=callbacks or [],
-    )
-
-
-def _lesson_search_queries(discipline: str, specialty: str) -> list[str]:
-    """Несколько вариантов запроса для лучшего покрытия документа."""
-    return [
-        f"{discipline} {specialty} компетенции знания умения навыки",
-        f"профессиональные компетенции ПК {discipline}",
-        f"общие компетенции ОК {specialty}",
-        f"{discipline} результаты освоения рабочая программа",
-    ]
-
-
 # ─── Загрузка индекса ─────────────────────────────────────────────────────────
 
 def load_index() -> tuple[FAISS, dict | None]:
@@ -241,8 +235,21 @@ def load_index() -> tuple[FAISS, dict | None]:
             f"FAISS-индекс не найден в {INDEX_DIR}. "
             "Сначала запусти indexer.py: poetry run python src/teacherfactory/indexer.py"
         )
-    embeddings = OllamaEmbeddings(model=CONFIG["model"]["embeddings"])
+    embeddings = get_embeddings()
     db = FAISS.load_local(str(INDEX_DIR), embeddings, allow_dangerous_deserialization=True)
+
+    # Проверка совместимости: размерность вектора в индексе должна совпадать
+    # с размерностью текущих эмбеддингов. Иначе similarity_search молча
+    # сломается или вернёт мусор.
+    index_dim = db.index.d
+    current_dim = len(embeddings.embed_query("test"))
+    if index_dim != current_dim:
+        raise RuntimeError(
+            f"FAISS-индекс несовместим с текущими эмбеддингами: "
+            f"индекс построен с dim={index_dim}, а активный провайдер даёт dim={current_dim}. "
+            f"Скорее всего, поменялся embeddings.provider в config — "
+            f"перестройте индекс кнопкой «Перестроить индекс» в боковой панели."
+        )
 
     bm25_data = None
     if BM25_PATH.exists():
@@ -312,7 +319,7 @@ def retrieve_context(
     candidate_docs = [doc_map[key] for key in rrf_top]
 
     # Cross-encoder reranking — оцениваем по первому (основному) запросу
-    primary_query = queries[0] if isinstance(queries[0], str) else queries[0]
+    primary_query = queries[0]
     reranker = _get_reranker()
     if reranker and len(candidate_docs) > k:
         pairs = [(primary_query, doc.page_content) for doc in candidate_docs]
@@ -364,13 +371,14 @@ def validate_competencies(card: LessonCard) -> dict[str, bool]:
 
 def generate_lesson_card(
     params: dict,
+    provider: LLMProvider | None = None,
     on_token: Callable[[int], None] | None = None,
     on_stage: Callable[[str], None] | None = None,
 ) -> LessonCard:
     """
     Сгенерировать технологическую карту урока.
 
-    params     — параметры урока (discipline, specialty, ...)
+    provider   — LLM-провайдер. Если None, выбирается автоматически.
     on_token   — вызывается с кол-вом токенов на каждый новый токен от LLM
     on_stage   — вызывается с названием этапа: "index", "context", "generate"
     """
@@ -388,16 +396,23 @@ def generate_lesson_card(
     context = retrieve_context(db, bm25_data, queries)
 
     _stage("generate")
+    if provider is None:
+        provider = get_llm_provider(temperature=CONFIG["model"]["temperature"])
+
     prompt = ChatPromptTemplate.from_messages([
         ("system", SYSTEM_PROMPT),
         ("human", USER_PROMPT),
     ])
 
-    callbacks = [_TokenCallback(on_token)] if on_token else []
-    llm = _make_llm(streaming=True, callbacks=callbacks)
-    chain = prompt | llm.with_structured_output(LessonCard)
+    # Внедряем callback для подсчёта токенов в клиент провайдера
+    client = provider.get_client()
+    if on_token is not None:
+        client = client.bind(callbacks=[_TokenCallback(on_token)])
 
-    log.info("Генерирую карту: %s (модель: %s)", params["lesson_topic"], CONFIG["model"]["llm"])
+    chain = prompt | client.with_structured_output(LessonCard)
+
+    log.info("Генерирую карту: %s (провайдер: %s, модель: %s)",
+             params["lesson_topic"], provider.name, provider.config.model_name)
     result = chain.invoke({"context": context, **params})
     log.info("Карта готова: %s", result.lesson_topic)
     return result
@@ -405,7 +420,10 @@ def generate_lesson_card(
 
 # ─── Чат с документами ────────────────────────────────────────────────────────
 
-def stream_chat_response(question: str) -> Generator[str, None, None]:
+def stream_chat_response(
+    question: str,
+    provider: LLMProvider | None = None,
+) -> Generator[str, None, None]:
     """
     Потоковый RAG-чат по документам без генерации файлов.
 
@@ -413,13 +431,14 @@ def stream_chat_response(question: str) -> Generator[str, None, None]:
     гипотетический ответ и ищет по нему — улучшает точность для
     разговорных вопросов об образовательном процессе.
     """
+    if provider is None:
+        provider = get_llm_provider(temperature=CONFIG["model"]["chat_temperature"])
+
     db, bm25_data = load_index()
-    llm = _make_llm(temperature=CONFIG["model"]["chat_temperature"])
 
     is_list_query = bool(_LIST_INTENT_RE.search(question))
     specialty_match = _SPECIALTY_CODE_RE.search(question)
 
-    # Если запрос называет конкретную специальность — берём ВСЕ чанки из её файлов
     if specialty_match and bm25_data:
         context = _retrieve_by_specialty(
             bm25_data,
@@ -429,18 +448,15 @@ def stream_chat_response(question: str) -> Generator[str, None, None]:
         )
         log.info("Используется фильтрация по специальности %s", specialty_match.group())
     else:
-        # Для запросов "перечисли все ОК/ПК" увеличиваем k
         chat_k = CONFIG["rag"].get("chat_k", 15)
         effective_k = chat_k * 2 if is_list_query else chat_k
         if is_list_query:
             log.info("Обнаружен запрос-перечисление, увеличиваю k до %d", effective_k)
 
-        # HyDE: генерируем гипотетический документ для лучшего поиска
         search_query: str | list[str] = question
         if CONFIG["rag"].get("hyde_enabled", False):
             try:
-                hyde_prompt = HYDE_PROMPT.format(question=question)
-                hypothetical = llm.invoke(hyde_prompt).content
+                hypothetical = provider.generate(HYDE_PROMPT.format(question=question))
                 search_query = [hypothetical, question]
                 log.info("HyDE: сгенерирован гипотетический документ (%d симв.)", len(hypothetical))
             except Exception as e:
@@ -448,14 +464,10 @@ def stream_chat_response(question: str) -> Generator[str, None, None]:
 
         context = retrieve_context(db, bm25_data, search_query, k=effective_k)
 
-    prompt = ChatPromptTemplate.from_messages([
-        ("system", CHAT_SYSTEM_PROMPT),
-        ("human", "{question}"),
-    ])
-    chain = prompt | _make_llm(temperature=CONFIG["model"]["chat_temperature"])
-
-    for chunk in chain.stream({"context": context, "question": question}):
-        yield chunk.content
+    messages = [
+        {"role": "user", "content": f"Контекст:\n{context}\n\nВопрос: {question}"},
+    ]
+    yield from provider.stream_chat(messages, system_prompt=CHAT_SYSTEM_PROMPT)
 
 
 # ─── Рендеринг DOCX ───────────────────────────────────────────────────────────

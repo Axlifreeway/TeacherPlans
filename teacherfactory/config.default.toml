@@ -3,41 +3,61 @@
 # Чтобы переопределить под конкретную машину — создай рядом файл
 # config.local.toml (он в .gitignore) и впиши только нужные ключи.
 #
-# Пример config.local.toml для десктопа (RTX 3080 Ti, 32 GB RAM):
+# Пример config.local.toml для десктопа (RTX 3080 Ti, 32 GB RAM) с Groq:
 #
 #   [model]
 #   llm = "qwen2.5:14b"
 #   num_gpu = -1
 #
+#   [groq]
+#   api_key = "gsk_..."
+#   model = "llama-3.1-8b-instant"
+#
 # ВАЖНО: смена embeddings требует полного перестроения индекса!
 
 [model]
 llm = "llama3.1:8b"
-embeddings = "nomic-embed-text"
+embeddings = "nomic-embed-text"   # модель эмбеддингов для provider="ollama"
 temperature = 0.1        # для генерации карт (низкая = детерминированно)
 chat_temperature = 0.7   # для свободного чата
 num_gpu = 0              # 0 = CPU only, -1 = все слои на GPU
 keep_alive = "10m"       # держать модель в VRAM между запросами
 
-[groq]
-# API ключ Groq (получить бесплатно: https://console.groq.com/keys)
-# Раскомментируй и вставь свой ключ, чтобы использовать Groq вместо Ollama
-# Либо установи переменную окружения GROQ_API_KEY
-# api_key = "gsk_..."
-# model = "llama-3.1-8b-instant"  # или "llama-3.1-70b-versatile", "mixtral-8x7b-32768"
+[embeddings]
+# Где брать эмбеддинги для FAISS-индекса:
+#   "ollama"      — через локальный Ollama-сервер (модель из [model].embeddings).
+#                    Быстро, но требует запущенного `ollama serve`.
+#   "huggingface" — локально через sentence-transformers (HF-модель ниже).
+#                    Не требует Ollama. Чуть медленнее, но удобно при работе с Groq.
+# ВАЖНО: смена провайдера = индекс несовместим, его нужно перестроить
+# (кнопка «Перестроить индекс» в боковой панели).
+provider = "ollama"
+hf_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
-# Доступные модели Groq:
-# - llama-3.1-8b-instant (быстрая, 8B параметров)
-# - llama-3.1-70b-versatile (качественная, 70B параметров)
-# - mixtral-8x7b-32768 (MoE архитектура)
-# - gemma-7b-it (Google)
-# Бесплатные лимиты: ~30 запросов/мин для 8B, ~15 запросов/мин для 70B
+[groq]
+# API-ключ Groq (бесплатный: https://console.groq.com/keys).
+# Класть сюда коммит-в-репо нельзя — продублируй в config.local.toml
+# или в переменную окружения GROQ_API_KEY.
+# api_key = "gsk_..."
+# model = "llama-3.1-8b-instant"
+#
+# Актуальные модели на Groq (список меняется,
+# сверяться с https://console.groq.com/docs/models):
+#   - llama-3.1-8b-instant         (быстрая, дефолт)
+#   - llama-3.3-70b-versatile      (мощная, медленнее)
+#   - gemma2-9b-it                 (Google Gemma 2 9B)
+#   - deepseek-r1-distill-llama-70b (рассуждающая)
+#
+# Лимиты Free Tier (RPM/RPD/TPM) — см. https://console.groq.com/docs/rate-limits
 
 [rag]
 chunk_size = 800
 chunk_overlap = 200
 retrieval_k = 5           # финальное число чанков в контекст (генерация карт)
-chat_k = 15               # чанков для чата (больше, чем для генерации)
+chat_k = 10               # чанков для чата (больше, чем для генерации)
+chat_specialty_k = 20     # верхний предел чанков при запросе с кодом специальности.
+                          # На free tier Groq для llama-3.3-70b лимит TPM = 12k —
+                          # больше 20 чанков по 800 симв. упрётся в rate limit.
 retrieval_candidates = 20 # кандидатов до reranking (берём с запасом)
 # Мультиязычный cross-encoder reranker (~120 MB, скачивается автоматически).
 reranker_model = "cross-encoder/mmarco-mMiniLMv2-L12-H384-v1"
