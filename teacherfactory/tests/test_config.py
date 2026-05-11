@@ -5,6 +5,7 @@
   - корректность обязательных полей
 """
 
+import shutil
 import tomllib
 from pathlib import Path
 from unittest.mock import mock_open, patch
@@ -82,7 +83,6 @@ def test_config_merge_overrides_llm(tmp_path):
     # Патчим _ROOT в config.py чтобы он смотрел в tmp_path
     with patch("config._ROOT", tmp_path):
         # Копируем дефолтный конфиг в tmp_path
-        import shutil
         shutil.copy(CONFIG_ROOT / "config.default.toml", tmp_path / "config.default.toml")
 
         from config import _load
@@ -99,7 +99,6 @@ def test_config_merge_partial_override(tmp_path):
     local_content = b'[model]\nnum_gpu = -1\n'
     (tmp_path / "config.local.toml").write_bytes(local_content)
 
-    import shutil
     shutil.copy(CONFIG_ROOT / "config.default.toml", tmp_path / "config.default.toml")
 
     with patch("config._ROOT", tmp_path):
@@ -114,7 +113,6 @@ def test_config_merge_partial_override(tmp_path):
 
 def test_config_no_local_file(tmp_path):
     """Отсутствие config.local.toml не должно вызывать ошибку."""
-    import shutil
     shutil.copy(CONFIG_ROOT / "config.default.toml", tmp_path / "config.default.toml")
     # config.local.toml НЕ создаём
 
