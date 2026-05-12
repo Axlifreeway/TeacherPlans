@@ -5,10 +5,8 @@
   - overlap работает корректно
 """
 
-import pytest
 from langchain_core.documents import Document
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-
 
 # Копия разделителей из indexer.py — тестируем именно их поведение
 _SEPARATORS = ["\n\n\n", "\n\n", "\n", ". ", ", ", " ", ""]
@@ -23,6 +21,7 @@ def _make_splitter(chunk_size: int = 800, chunk_overlap: int = 200):
 
 
 # ─── Размеры чанков ───────────────────────────────────────────────────────────
+
 
 def test_chunks_respect_max_size():
     """Ни один чанк не должен превышать chunk_size (с небольшим допуском)."""
@@ -53,6 +52,7 @@ def test_short_doc_single_chunk():
 
 # ─── Структурные разделители ──────────────────────────────────────────────────
 
+
 def test_newline_separator_preferred():
     """
     Чанкер должен предпочитать разрывы по строкам, а не посередине предложения.
@@ -60,12 +60,14 @@ def test_newline_separator_preferred():
     """
     splitter = _make_splitter(chunk_size=100, chunk_overlap=0)
     # Текст из строк таблицы — каждая строка ~50 символов
-    table_text = "\n".join([
-        "ОК 01 Выбирать способы решения задач",
-        "ОК 02 Использовать средства поиска",
-        "ОК 04 Работать в коллективе и команде",
-        "ОК 05 Осуществлять коммуникацию",
-    ])
+    table_text = "\n".join(
+        [
+            "ОК 01 Выбирать способы решения задач",
+            "ОК 02 Использовать средства поиска",
+            "ОК 04 Работать в коллективе и команде",
+            "ОК 05 Осуществлять коммуникацию",
+        ]
+    )
     doc = Document(page_content=table_text, metadata={})
     chunks = splitter.split_documents([doc])
 
@@ -75,9 +77,7 @@ def test_newline_separator_preferred():
         for line in lines:
             # Каждая строка должна начинаться с ОК или быть пустой
             if line.strip():
-                assert line.strip().startswith("ОК"), (
-                    f"Строка таблицы разрезана: '{line}'"
-                )
+                assert line.strip().startswith("ОК"), f"Строка таблицы разрезана: '{line}'"
 
 
 def test_metadata_preserved():
@@ -94,6 +94,7 @@ def test_metadata_preserved():
 
 
 # ─── Overlap ──────────────────────────────────────────────────────────────────
+
 
 def test_overlap_creates_continuity():
     """Соседние чанки должны иметь перекрытие (общий текст)."""

@@ -12,7 +12,7 @@
 
 from typing import Any
 
-from config import CONFIG
+from teacherfactory.config import CONFIG
 
 # Кэш по ключу (provider, model_name): HF-модель занимает ~470 МБ и грузится
 # в память несколько секунд. Без кэша Streamlit перезагружал бы её на каждый
@@ -45,6 +45,7 @@ def get_embeddings() -> Any:
     if key in _cache:
         return _cache[key]
 
+    instance: Any
     if provider == "huggingface":
         from langchain_community.embeddings import HuggingFaceEmbeddings
 

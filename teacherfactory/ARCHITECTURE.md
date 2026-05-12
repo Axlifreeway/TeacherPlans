@@ -1,236 +1,130 @@
-# TeacherFactory: Архитектура и безопасность
+# Архитектура TeacherFactory
 
-## Обзор архитектуры
-
-### Компоненты системы
+## Слои
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│                    Streamlit Interface                       │
-│  (app.py - единая точка входа с переключением провайдеров)  │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                   LLM Provider Layer                         │
-│  (llm_provider.py - абстрактный интерфейс для всех LLM)     │
-│  ┌──────────────┐  ┌──────────────┐                         │
-│  │ OllamaProvider│  │ GroqProvider │                         │
-│  │  (локально)   │  │   (облако)   │                         │
-│  └──────────────┘  └──────────────┘                         │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Generator Layer                           │
-│  (generator.py - бизнес-логика генерации карт и чата)       │
-│  • RAG поиск (FAISS + BM25 → RRF → reranking)              │
-│  • HyDE для улучшения поиска                                │
-│  • Валидация компетенций                                    │
-└─────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────┐
-│                    Data Layer                                │
-│  • FAISS индекс (векторный поиск)                           │
-│  • BM25 индекс (лексический поиск)                          │
-│  • Конфигурация (config.default.toml + config.local.toml)  │
-└─────────────────────────────────────────────────────────────┘
+┌────────────────────────────────────────────────────────────────┐
+│  views/                  Streamlit UI                          │
+│  sidebar · single · batch · chat · errors · common             │
+└──────────────────────────────┬─────────────────────────────────┘
+                               │
+┌──────────────────────────────▼─────────────────────────────────┐
+│  pipeline.py             Оркестрация                           │
+│  generate_document(doc_type, params) ─┐                        │
+│  stream_chat_response(question) ──────┤                        │
+└──────────────────────────────┬────────┴────────────────────────┘
+                               │
+        ┌──────────────────────┼──────────────────────┐
+        ▼                      ▼                      ▼
+  ┌───────────┐         ┌────────────┐         ┌────────────┐
+  │ retrieval │         │ documents/ │         │   render   │
+  │           │         │            │         │            │
+  │ load_     │         │ Document-  │         │ render_    │
+  │ index     │         │ Type[T]    │         │ document   │
+  │           │         │ +REGISTRY  │         │ +sanitize  │
+  │ retrieve_ │         │            │         │ filename   │
+  │ context   │         │ • lesson_  │         │            │
+  │           │         │   card     │         │            │
+  │ BM25Index │         │ • <future> │         │            │
+  └─────┬─────┘         └─────┬──────┘         └────────────┘
+        │                     │
+        ▼                     ▼
+  ┌────────────┐        ┌──────────┐
+  │ embeddings │        │  model   │   (Pydantic-схемы)
+  │  llm_      │        │          │
+  │ provider   │        └──────────┘
+  └────────────┘
 ```
+
+## Ключевые модули
+
+| Модуль | Ответственность |
+|---|---|
+| `paths.py` | Все Path-константы. Никто другой не делает `Path.home() / ...`. |
+| `text_utils.py` | `tokenize`, `COMPETENCY_RE`, `LIST_INTENT_RE`, `SPECIALTY_CODE_RE`, `normalize_code`. |
+| `config.py` | Лениво читает `config.default.toml` + опциональный `config.local.toml`. |
+| `embeddings.py` | Фабрика эмбеддингов (Ollama / HuggingFace). |
+| `llm_provider.py` | `LLMProvider` ABC, `OllamaProvider`, `GroqProvider`, фабрика `get_llm_provider()`. `api_key` хранится в `SecretStr`. |
+| `model.py` | Pydantic-схемы (сейчас `LessonCard`). |
+| `retrieval.py` | `BM25Index` (JSON), `load_index`, `retrieve_context` (FAISS + BM25 → RRF → reranker), `retrieve_by_specialty`. |
+| `documents/` | Реестр типов документов: `DocumentType[T]` + регистрации (сейчас только `LESSON_CARD`). |
+| `pipeline.py` | `generate_document` (универсальный по `DocumentType[T]`), `stream_chat_response` (с HyDE). |
+| `validation.py` | Пост-валидация (проверка кодов компетенций по индексу). |
+| `render.py` | `render_document` (docxtpl) + `build_output_filename` с санитизацией. |
+| `indexer.py` | CLI/функция построения индекса из `docs/`. |
+| `views/` | Streamlit-вкладки. Не содержат бизнес-логики, только UI поверх pipeline. |
+| `app.py` | Точка входа Streamlit. |
+
+## Поток одного запроса
+
+`generate_document(LESSON_CARD, params)`:
+
+1. **Проверка params**: `DocumentType.required_params` → если чего-то нет, `ValueError` *до* вызова LLM.
+2. **Загрузка индекса**: `load_index()` → FAISS + `BM25Index` (или `None`).
+3. **Построение запросов**: `LESSON_CARD.build_queries(params)` → мультизапрос.
+4. **Retrieval**: для каждого запроса — FAISS dense + BM25 sparse → RRF слияние → cross-encoder reranking → топ-K.
+5. **LLM**: `ChatPromptTemplate(system + user) | client.with_structured_output(LessonCard)` → Pydantic-объект.
+6. **(опционально) Валидация**: `LESSON_CARD.validate(card)` → словарь `{код: bool}`.
+7. **Рендеринг**: `render_document(LESSON_CARD, card, out_path)` → DOCX.
+
+## Реестр типов документов
+
+Каждый тип документа — это `DocumentType[T]` (см. [`CONTRIBUTING.md`](CONTRIBUTING.md)):
+
+```python
+@dataclass(frozen=True)
+class DocumentType[T: BaseModel]:
+    slug: str
+    title: str
+    model: type[T]
+    template_path: Path
+    system_prompt: str
+    user_prompt: str
+    build_queries: Callable[[dict], list[str]]
+    filename_pattern: str
+    validate: Callable[[T], dict[str, bool]] | None
+    to_template_context: Callable[[T], dict] | None
+    required_params: tuple[str, ...]
+```
+
+`pipeline.generate_document` параметризован по `T: BaseModel` — благодаря PEP 695
+он точно знает, что возвращает именно `T` (а не `BaseModel`), и mypy это видит.
+
+## RAG-стек
+
+- **Чанкинг** (`indexer.py`): `RecursiveCharacterTextSplitter` с приоритетом строк
+  и абзацев — чтобы не резать таблицы компетенций.
+- **Dense поиск**: FAISS + эмбеддинги (Ollama `nomic-embed-text` либо HF
+  `paraphrase-multilingual-MiniLM-L12-v2`).
+- **Sparse поиск**: BM25Okapi с нормализацией кодов ОК/ПК (`ОК01` ↔ `ОК 01`).
+- **Слияние**: Reciprocal Rank Fusion с `K=60` (Cormack et al. 2009).
+- **Reranking**: cross-encoder `mmarco-mMiniLMv2` (~120 МБ, ленивая загрузка).
+- **HyDE** (для чата): гипотетический документ-ответ как доп. запрос.
+- **Спец-фильтр**: код специальности `09.01.03` в имени файла → таргетный поиск.
+
+## Хранилище
+
+- FAISS — `~/.teacherfactory/faiss_index/` (бинарь + pickle docstore из LangChain).
+- BM25 — `~/.teacherfactory/faiss_index/bm25.json` (с версионированной схемой).
+- Сгенерированные DOCX — `~/.teacherfactory/output/`.
+
+Никаких pickle в нашем коде. FAISS использует pickle внутри — мы документируем
+threat model в [`SECURITY.md`](SECURITY.md).
 
 ## Безопасность
 
-### 1. Управление секретами
+См. [`SECURITY.md`](SECURITY.md) — отдельный документ.
 
-**API ключи хранятся тремя способами (по приоритету):**
+## Что НЕ так в архитектуре прямо сейчас
 
-1. **Переменные окружения** (рекомендуется)
-   ```bash
-   export GROQ_API_KEY="gsk_..."
-   ```
+Честный список (для контрибьюторов):
 
-2. **Файл `.env`** (локальная разработка)
-   ```
-   GROQ_API_KEY=gsk_...
-   ```
-   Файл `.env` добавлен в `.gitignore` и никогда не попадёт в репозиторий.
-
-3. **Файл `config.local.toml`** (альтернатива)
-   ```toml
-   [groq]
-   api_key = "gsk_..."
-   ```
-   Файл `config.local.toml` также в `.gitignore`.
-
-**Почему это безопасно:**
-- ✅ Секреты не хранятся в коде
-- ✅ Разные конфигурации для разных окружений
-- ✅ Легко ротировать ключи
-- ✅ Подходит для CI/CD
-
-### 2. Валидация конфигурации
-
-Используется Pydantic для строгой типизации и валидации:
-
-```python
-from pydantic import BaseModel, Field, ValidationError
-
-class ProviderConfig(BaseModel):
-    provider_type: LLMProviderType
-    model_name: str
-    api_key: Optional[str] = None
-    temperature: float = 0.7
-    max_retries: int = 3
-    timeout: int = 60
-```
-
-**Преимущества:**
-- Автоматическая проверка типов
-- Явные ошибки при неправильной конфигурации
-- Документация через аннотации типов
-
-### 3. Изоляция провайдеров
-
-Каждый LLM-провайдер инкапсулирован в отдельном классе:
-
-```python
-class LLMProvider(ABC):
-    @abstractmethod
-    def generate(self, prompt: str, system_prompt: str = "") -> str:
-        pass
-    
-    @abstractmethod
-    def stream_chat(...) -> Generator[str, None, None]:
-        pass
-```
-
-**Преимущества:**
-- Замена провайдера не влияет на остальной код
-- Легко добавить нового провайдера (OpenAI, Anthropic, etc.)
-- Тестирование каждого провайдера независимо
-
-### 4. Защита от утечек данных
-
-**Что защищено:**
-- API ключи не логируются
-- Конфиденциальные данные не отправляются без явного согласия
-- Локальные файлы не передаются наружу (кроме как в выбранный LLM)
-
-**Рекомендации для production:**
-- Использовать HTTPS для доступа к Streamlit
-- Добавить аутентификацию (streamlit-authenticator)
-- Ограничить доступ по IP (если нужно)
-
-## UX Улучшения
-
-### 1. Переключатель провайдеров в реальном времени
-
-Пользователь может выбрать между:
-- **Ollama** (локально, бесплатно, без интернета, но медленно)
-- **Groq** (облако, бесплатно с лимитами, быстро, нужен интернет)
-
-**Интерфейс:**
-```
-🔧 Настройки LLM
-├─ ⚪ Ollama (llama3.1:8b)
-├─ 🔵 Groq (llama-3.1-8b-instant)
-│
-Статус провайдеров:
-├─ ✅ Ollama: `llama3.1:8b`
-├─ ✅ Groq: `llama-3.1-8b-instant`
-```
-
-### 2. Стриминг ответов
-
-Эффект "печатной машинки" вместо ожидания полного ответа:
-
-```python
-response = st.write_stream(
-    provider.stream_chat(messages, system_prompt=...)
-)
-```
-
-**Преимущества:**
-- Пользователь видит прогресс сразу
-- Меньше ощущение задержки
-- Можно прервать генерацию
-
-### 3. Индикаторы статуса
-
-Визуальная обратная связь на каждом этапе:
-- ✅ Индекс готов / ❌ Индекс не построен
-- ✅ Ollama доступен / ❌ Ollama не запущен
-- 🔄 Генерация... (с указанием текущего этапа)
-
-### 4. Экспорт истории чата
-
-Сохранение диалогов в JSON:
-```json
-{
-  "chat_history": [...],
-  "export_date": "2025-01-15T10:30:00",
-  "llm_provider": "groq"
-}
-```
-
-### 5. Блокировка интерфейса
-
-Во время генерации кнопки блокируются, предотвращая дублирующие запросы.
-
-## Сравнение провайдеров
-
-| Характеристика | Ollama | Groq |
-|---------------|--------|------|
-| **Стоимость** | Бесплатно | Бесплатно (с лимитами) |
-| **Требования** | Локальное железо | Только интернет |
-| **Скорость** | Зависит от GPU | ~100 токенов/сек |
-| **Лимиты** | Нет | ~30 запросов/мин (8B), ~15 запросов/мин (70B) |
-| **Приватность** | Полная | Данные у Groq |
-| **Модели** | Любые из Ollama Hub | Llama, Mixtral, Gemma |
-
-**Рекомендация:**
-- Для локальной разработки и полной приватности → **Ollama**
-- Для быстрого доступа и работы с методистом → **Groq**
-
-## Как добавить нового провайдера
-
-1. Создать класс-наследник `LLMProvider`:
-
-```python
-class OpenAIProvider(LLMProvider):
-    @property
-    def name(self) -> str:
-        return "OpenAI"
-    
-    def _create_client(self) -> Any:
-        from langchain_openai import ChatOpenAI
-        return ChatOpenAI(api_key=self.config.api_key, ...)
-    
-    # ... реализовать остальные методы
-```
-
-2. Добавить в фабрику `get_llm_provider()`:
-
-```python
-elif provider_type == LLMProviderType.OPENAI:
-    return OpenAIProvider(config)
-```
-
-3. Обновить `list_available_providers()`
-
-Готово! Интерфейс автоматически подхватит нового провайдера.
-
-## Заключение
-
-Текущая архитектура обеспечивает:
-- ✅ **Безопасность**: секреты вне кода, валидация конфигурации
-- ✅ **Гибкость**: легкое переключение между провайдерами
-- ✅ **Масштабируемость**: просто добавить нового провайдера
-- ✅ **UX**: стриминг, индикаторы, экспорт
-- ✅ **Бесплатность**: оба провайдера бесплатны (Groq с разумными лимитами)
-
-Для предоставления доступа методисту:
-1. Настройте Groq API ключ
-2. Запустите приложение на вашем ПК
-3. Используйте Cloudflare Tunnel для доступа извне
-4. Методист получает ссылку и работает через браузер без установки ПО
+- `CONFIG` грузится на импорт модуля. Это удобно, но создаёт скрытую зависимость.
+  Сейчас mitigations: `get_llm_provider(config_dict=...)` принимает явный конфиг
+  для тестов. Долгосрочно — DI-контейнер.
+- `views/` зависят от глобального `st.session_state`. Стриминговая природа
+  Streamlit плохо тестируется — UI-смок только руками.
+- В `embeddings.py` глобальный `_cache` без блокировок. Streamlit single-thread,
+  но если когда-то отделим backend от UI — пересмотреть.
+- `validate_competencies` делает по одному retrieval-запросу на код. На карте
+  с 7 кодами это 7 запросов к индексу. Не критично, но кешировать стоит.

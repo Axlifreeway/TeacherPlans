@@ -1,0 +1,28 @@
+# Локальный запуск TeacherFactory в контейнере.
+#
+# Использование:
+#   1. Положи нормативные документы в ./docs/
+#   2. Создай .env с GROQ_API_KEY (см. .env.example), либо config.local.toml.
+#   3. docker compose up --build
+#   4. Открой http://localhost:8501
+#
+# Индекс и сгенерированные документы хранятся в volume teacherfactory_data,
+# чтобы не пересобирались при каждом перезапуске.
+
+services:
+  teacherfactory:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: teacherfactory:latest
+    ports:
+      - "8501:8501"
+    env_file:
+      - .env
+    volumes:
+      - ./docs:/app/docs:ro
+      - teacherfactory_data:/home/app/.teacherfactory
+    restart: unless-stopped
+
+volumes:
+  teacherfactory_data:

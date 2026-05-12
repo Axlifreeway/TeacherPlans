@@ -19,18 +19,18 @@ import logging
 import os
 from abc import ABC, abstractmethod
 from collections.abc import Generator
-from enum import Enum
+from enum import StrEnum
 from typing import Any
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, SecretStr, ValidationError
 
-from config import CONFIG
+from teacherfactory.config import CONFIG
 
 log = logging.getLogger(__name__)
 
 
-class LLMProviderType(str, Enum):
+class LLMProviderType(StrEnum):
     OLLAMA = "ollama"
     GROQ = "groq"
 
@@ -38,7 +38,9 @@ class LLMProviderType(str, Enum):
 class ProviderConfig(BaseModel):
     provider_type: LLMProviderType
     model_name: str
-    api_key: str | None = None
+    # SecretStr: исключаем ключ из repr/str и из любых случайных логов.
+    # Доступ к самому значению — только через api_key.get_secret_value().
+    api_key: SecretStr | None = None
     base_url: str | None = None
     temperature: float = 0.7
     num_gpu: int = 0
@@ -74,13 +76,13 @@ class LLMProvider(ABC):
             messages.append(SystemMessage(content=system_prompt))
         messages.append(HumanMessage(content=prompt))
         response = self.get_client().invoke(messages)
-        return response.content
+        return str(response.content)
 
     def stream_chat(
         self,
         messages: list[dict[str, str]],
         system_prompt: str = "",
-    ) -> Generator[str, None, None]:
+    ) -> Generator[str]:
         chat_messages: list[Any] = []
         if system_prompt:
             chat_messages.append(SystemMessage(content=system_prompt))
@@ -119,9 +121,9 @@ class OllamaProvider(LLMProvider):
             import requests
 
             response = requests.get("http://localhost:11434/api/tags", timeout=2)
-            return response.status_code == 200
-        except Exception:
+        except (requests.RequestException, OSError):
             return False
+        return bool(response.status_code == 200)
 
 
 class GroqProvider(LLMProvider):
@@ -132,25 +134,27 @@ class GroqProvider(LLMProvider):
     def _create_client(self) -> Any:
         from langchain_groq import ChatGroq
 
-        if not self.config.api_key:
+        if self.config.api_key is None:
             raise ValueError("Groq API ключ не настроен")
 
         return ChatGroq(
-            api_key=self.config.api_key,
-            model_name=self.config.model_name,
+            api_key=self.config.api_key,  # ChatGroq принимает SecretStr напрямую
+            model=self.config.model_name,
             temperature=self.config.temperature,
             streaming=True,
         )
 
     def is_available(self) -> bool:
-        return bool(self.config.api_key)
+        return self.config.api_key is not None
 
 
 # ─── Фабрика ──────────────────────────────────────────────────────────────────
 
-def _groq_api_key(config_dict: dict) -> str | None:
+
+def _groq_api_key(config_dict: dict) -> SecretStr | None:
     """Берёт ключ Groq из конфига или переменной окружения."""
-    return config_dict.get("groq", {}).get("api_key") or os.getenv("GROQ_API_KEY")
+    raw = config_dict.get("groq", {}).get("api_key") or os.getenv("GROQ_API_KEY")
+    return SecretStr(raw) if raw else None
 
 
 def _make_config(
@@ -210,7 +214,7 @@ def get_llm_provider(
 
     config = _make_config(provider_type, cfg, temperature=temperature)
     if provider_type == LLMProviderType.GROQ:
-        if not config.api_key:
+        if config.api_key is None:
             raise ValueError("Groq API ключ не настроен")
         return GroqProvider(config)
     return OllamaProvider(config)
@@ -221,13 +225,11 @@ def list_available_providers(config_dict: dict | None = None) -> list[dict[str, 
     cfg = config_dict if config_dict is not None else CONFIG
 
     ollama_model = cfg["model"]["llm"]
-    ollama_available = OllamaProvider(
-        _make_config(LLMProviderType.OLLAMA, cfg)
-    ).is_available()
+    ollama_available = OllamaProvider(_make_config(LLMProviderType.OLLAMA, cfg)).is_available()
 
     groq_cfg = cfg.get("groq", {})
     groq_model = groq_cfg.get("model", "llama-3.1-8b-instant")
-    groq_available = bool(_groq_api_key(cfg))
+    groq_available = _groq_api_key(cfg) is not None
 
     return [
         {
@@ -246,11 +248,11 @@ def list_available_providers(config_dict: dict | None = None) -> list[dict[str, 
 
 
 __all__ = [
-    "LLMProviderType",
-    "ProviderConfig",
-    "LLMProvider",
-    "OllamaProvider",
     "GroqProvider",
+    "LLMProvider",
+    "LLMProviderType",
+    "OllamaProvider",
+    "ProviderConfig",
     "get_llm_provider",
     "list_available_providers",
 ]

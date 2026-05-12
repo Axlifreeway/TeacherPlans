@@ -15,11 +15,11 @@ def _load() -> dict:
     default_path = _ROOT / "config.default.toml"
     local_path = _ROOT / "config.local.toml"
 
-    with open(default_path, "rb") as f:
+    with default_path.open("rb") as f:
         cfg = tomllib.load(f)
 
     if local_path.exists():
-        with open(local_path, "rb") as f:
+        with local_path.open("rb") as f:
             overrides = tomllib.load(f)
         for section, values in overrides.items():
             if section in cfg and isinstance(cfg[section], dict):

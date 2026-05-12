@@ -1,0 +1,23 @@
+# Конфиг gitleaks. Использует встроенный набор правил + явно ищет Groq-ключи.
+# https://github.com/gitleaks/gitleaks#configuration
+
+[extend]
+useDefault = true
+
+[[rules]]
+id = "groq-api-key"
+description = "Groq API key (gsk_*)"
+regex = '''gsk_[A-Za-z0-9]{20,}'''
+tags = ["key", "groq"]
+
+[allowlist]
+description = "Безопасные плейсхолдеры в документации и примерах"
+paths = [
+    '''.*\.md$''',                       # документация
+    '''.*\.example\.toml$''',
+    '''.*\.env\.example$''',
+]
+regexes = [
+    '''gsk_\.\.\.''',                    # явный плейсхолдер «gsk_...»
+    '''gsk_FAKE_REAL_LOOKING_KEY_.*''',  # тестовый ключ из tests/
+]

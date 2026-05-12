@@ -1,23 +1,20 @@
 """Общие фикстуры для тестов TeacherFactory."""
 
-import sys
-from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
 from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
-# Добавляем src в путь, чтобы тесты находили модули
-sys.path.insert(0, str(Path(__file__).parent.parent / "src" / "teacherfactory"))
+from teacherfactory import retrieval
+from teacherfactory.retrieval import BM25Index
 
 
 @pytest.fixture(autouse=True)
 def mock_reranker(monkeypatch):
     """Глобально отключаем CrossEncoder во всех тестах — не скачиваем модели."""
-    import generator
-    monkeypatch.setattr(generator, "_get_reranker", lambda: None)
-    monkeypatch.setattr(generator, "_reranker", None)
+    monkeypatch.setattr(retrieval, "_get_reranker", lambda: None)
+    monkeypatch.setattr(retrieval, "_reranker", None)
 
 
 @pytest.fixture
@@ -39,9 +36,7 @@ def sample_docs() -> list[Document]:
             metadata={"source": "test_rpp.pdf", "page": 5},
         ),
         Document(
-            page_content=(
-                "ОК 04 Эффективно взаимодействовать и работать в коллективе и команде"
-            ),
+            page_content=("ОК 04 Эффективно взаимодействовать и работать в коллективе и команде"),
             metadata={"source": "test_rpp.pdf", "page": 5},
         ),
         Document(
@@ -59,15 +54,11 @@ def sample_docs() -> list[Document]:
             metadata={"source": "test_rpd.pdf", "page": 3},
         ),
         Document(
-            page_content=(
-                "ПК 1.6 Формировать запросы для получения информации в базах данных"
-            ),
+            page_content=("ПК 1.6 Формировать запросы для получения информации в базах данных"),
             metadata={"source": "test_rpd.pdf", "page": 3},
         ),
         Document(
-            page_content=(
-                "ПК 1.7 Выполнять операции с объектами базы данных"
-            ),
+            page_content=("ПК 1.7 Выполнять операции с объектами базы данных"),
             metadata={"source": "test_rpd.pdf", "page": 3},
         ),
         Document(
@@ -81,10 +72,10 @@ def sample_docs() -> list[Document]:
 
 
 @pytest.fixture
-def bm25_data(sample_docs: list[Document]) -> dict:
+def bm25_data(sample_docs: list[Document]) -> BM25Index:
+    """BM25Index, готовый к использованию в retrieve_context / validate_competencies."""
     corpus = [doc.page_content.lower().split() for doc in sample_docs]
-    bm25 = BM25Okapi(corpus)
-    return {"bm25": bm25, "chunks": sample_docs}
+    return BM25Index(bm25=BM25Okapi(corpus), chunks=sample_docs)
 
 
 @pytest.fixture

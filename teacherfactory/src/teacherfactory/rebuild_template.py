@@ -1,28 +1,26 @@
 """
-Скрипт для пересоздания шаблона template.docx с правильной структурой docxtpl.
+Скрипт для пересоздания шаблона технологической карты.
 
-Запуск: poetry run python src/teacherfactory/rebuild_template.py
+Запуск: poetry run python -m teacherfactory.rebuild_template
 """
 
 from docx import Document
-from docx.shared import Cm, Pt
-from docx.enum.text import WD_ALIGN_PARAGRAPH
-from pathlib import Path
+from docx.shared import Pt
 
+from teacherfactory.paths import LESSON_CARD_TEMPLATE
 
-PROJECT_ROOT = Path(__file__).parent.parent.parent
-OUTPUT_PATH = PROJECT_ROOT / "template_fixed.docx"
+OUTPUT_PATH = LESSON_CARD_TEMPLATE
 
 
 def build_template():
     doc = Document()
-    style = doc.styles['Normal']
-    style.font.name = 'Times New Roman'
+    style = doc.styles["Normal"]
+    style.font.name = "Times New Roman"
     style.font.size = Pt(12)
 
     # === Основная таблица ===
     table = doc.add_table(rows=29, cols=3)
-    table.style = 'Table Grid'
+    table.style = "Table Grid"
 
     def merge_and_set(row_idx, text, merge_cols=True):
         row = table.rows[row_idx]
@@ -36,7 +34,10 @@ def build_template():
         table.rows[row_idx].cells[1].text = value_template
 
     # Строка 0 — заголовок (объединённая)
-    merge_and_set(0, "Занятие №{{ lesson_number }} \nДата: {{ date }}\nГруппа: {{ group_name }}\nКурс: {{ course_number }}\nКол-во студентов: {{ students_count }}")
+    merge_and_set(
+        0,
+        "Занятие №{{ lesson_number }} \nДата: {{ date }}\nГруппа: {{ group_name }}\nКурс: {{ course_number }}\nКол-во студентов: {{ students_count }}",
+    )
 
     # Строки 1-7 — основная информация
     set_row(1, "Дисциплина / МДК", "{{ discipline }}")
@@ -100,11 +101,18 @@ def build_template():
     doc.add_paragraph("Ход занятия")
 
     lesson_table = doc.add_table(rows=3, cols=7)
-    lesson_table.style = 'Table Grid'
+    lesson_table.style = "Table Grid"
 
     # Заголовок
-    headers = ["№ п/п", "Этап", "Время, мин.", "Деятельность преподавателя",
-               "Деятельность студентов", "Методы и приёмы обучения", "Результат"]
+    headers = [
+        "№ п/п",
+        "Этап",
+        "Время, мин.",
+        "Деятельность преподавателя",
+        "Деятельность студентов",
+        "Методы и приёмы обучения",
+        "Результат",
+    ]
     for i, h in enumerate(headers):
         lesson_table.rows[0].cells[i].text = h
 

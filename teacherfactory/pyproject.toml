@@ -24,13 +24,115 @@ dependencies = [
     "python-docx (>=1.1.0,<2.0.0)"
 ]
 
+[project.scripts]
+teacherfactory-index = "teacherfactory.indexer:main"
+teacherfactory-rebuild-template = "teacherfactory.rebuild_template:build_template"
+
 [tool.poetry]
 packages = [{include = "teacherfactory", from = "src"}]
 
 [tool.poetry.group.dev.dependencies]
 pytest = ">=8.0.0"
 pytest-mock = ">=3.14.0"
+pytest-cov = ">=5.0.0"
+ruff = ">=0.7.0"
+mypy = ">=1.13.0"
+pre-commit = ">=4.0.0"
 
 [build-system]
 requires = ["poetry-core>=2.0.0,<3.0.0"]
 build-backend = "poetry.core.masonry.api"
+
+# ─── ruff ─────────────────────────────────────────────────────────────────────
+
+[tool.ruff]
+line-length = 100
+target-version = "py313"
+src = ["src", "tests"]
+extend-exclude = [".venv", "docs", "*.docx"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "UP",   # pyupgrade
+    "SIM",  # flake8-simplify
+    "C4",   # flake8-comprehensions
+    "PIE",  # flake8-pie
+    "RET",  # flake8-return
+    "RUF",  # ruff-specific
+    "S",    # flake8-bandit (security)
+    "PTH",  # flake8-use-pathlib
+    "TID",  # flake8-tidy-imports
+]
+ignore = [
+    "E501",   # длинные строки — мы и так стараемся, но Streamlit-блоки терпимы
+    "B008",   # function call in default args — Field(default_factory=...) и подобные
+    "S101",   # assert в тестах — это норма
+    "S301",   # pickle — мы знаем что делаем (см. retrieval.py)
+    "S603",   # subprocess — не используем
+    "RUF001", # cyrillic vs latin ambiguity — все строки русские, это нормально
+    "RUF002", # то же для docstrings
+    "RUF003", # то же для comments
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S105", "S106"]  # «hardcoded password» — это тестовые ключи
+"src/teacherfactory/views/*" = ["E402"]  # Streamlit-views часто разносят импорты
+
+[tool.ruff.lint.isort]
+known-first-party = ["teacherfactory"]
+combine-as-imports = true
+
+# ─── mypy ─────────────────────────────────────────────────────────────────────
+
+[tool.mypy]
+python_version = "3.13"
+files = ["src/teacherfactory"]
+strict_optional = true
+warn_unused_ignores = true
+warn_redundant_casts = true
+warn_return_any = true
+no_implicit_optional = true
+check_untyped_defs = true
+disallow_untyped_defs = false  # включить, когда хвост типизации будет полным
+ignore_missing_imports = true  # langchain / streamlit без full type stubs
+
+[[tool.mypy.overrides]]
+module = ["tests.*"]
+disallow_untyped_defs = false
+check_untyped_defs = false
+
+# ─── pytest + coverage ────────────────────────────────────────────────────────
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra --strict-markers --strict-config"
+markers = [
+    "integration: тесты, требующие реальный индекс или LLM (по умолчанию пропускаются)",
+]
+filterwarnings = [
+    "ignore::FutureWarning:transformers.*",
+    "ignore::DeprecationWarning:langchain_community.*",
+]
+
+[tool.coverage.run]
+source = ["src/teacherfactory"]
+omit = [
+    "src/teacherfactory/app.py",            # UI entry — тестируется руками
+    "src/teacherfactory/views/*",           # Streamlit-вьюхи — мокать не имеет смысла
+    "src/teacherfactory/rebuild_template.py",
+]
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "raise NotImplementedError",
+    "if __name__ == .__main__.:",
+    "if TYPE_CHECKING:",
+]
+show_missing = true
+skip_covered = false
