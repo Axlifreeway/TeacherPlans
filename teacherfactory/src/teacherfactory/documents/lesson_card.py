@@ -9,14 +9,24 @@ from teacherfactory.prompts import LESSON_SYSTEM_PROMPT, LESSON_USER_PROMPT
 
 
 def build_lesson_queries(params: dict) -> list[str]:
-    """Несколько вариантов запроса для лучшего покрытия документа."""
+    """
+    Мультизапрос в RAG-индекс для генерации карты урока.
+
+    Главная цель — поднять в контекст ту часть тематического плана РПД, где
+    конкретная тема привязана к конкретным ОК/ПК. Без `lesson_topic` в
+    запросе модель отбирает компетенции наугад из общего списка дисциплины
+    (см. ШАГ 2 рефакторинга).
+    """
     discipline = params["discipline"]
     specialty = params["specialty"]
+    topic = params.get("lesson_topic", "")
     return [
-        f"{discipline} {specialty} компетенции знания умения навыки",
-        f"профессиональные компетенции ПК {discipline}",
+        f"{topic} {discipline} тематический план",
+        f"{topic} {discipline} компетенции ОК ПК",
+        f"{discipline} {specialty} тематический план содержание дисциплины",
+        f"профессиональные компетенции ПК {discipline} {topic}",
         f"общие компетенции ОК {specialty}",
-        f"{discipline} результаты освоения рабочая программа",
+        f"{discipline} результаты освоения знания умения навыки рабочая программа",
     ]
 
 
@@ -53,7 +63,7 @@ LESSON_CARD: DocumentType[LessonCard] = DocumentType(
         "lesson_number",
         "date",
         "teacher_name",
-        "lesson_type",
+        "lesson_type_hint",
         "lesson_kind",
         "duration",
     ),

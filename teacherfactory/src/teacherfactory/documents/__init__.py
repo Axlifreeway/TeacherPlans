@@ -14,6 +14,7 @@
 
 from typing import Any
 
+from teacherfactory.documents.assessment_materials import ASSESSMENT_MATERIALS
 from teacherfactory.documents.base import DocumentType
 from teacherfactory.documents.lesson_card import LESSON_CARD
 
@@ -23,6 +24,7 @@ from teacherfactory.documents.lesson_card import LESSON_CARD
 # выборку из реестра.
 _REGISTRY: dict[str, DocumentType[Any]] = {
     LESSON_CARD.slug: LESSON_CARD,
+    ASSESSMENT_MATERIALS.slug: ASSESSMENT_MATERIALS,
 }
 
 

@@ -12,21 +12,17 @@ import streamlit as st
 
 from teacherfactory.config import CONFIG
 from teacherfactory.documents.lesson_card import LESSON_CARD
+from teacherfactory.model import LessonCard
 from teacherfactory.paths import OUTPUT_DIR
 from teacherfactory.pipeline import generate_document
+from teacherfactory.prompts import LESSON_TYPE_AUTO_HINT, LESSON_TYPE_CHOICES
 from teacherfactory.render import build_output_filename, render_document
-from teacherfactory.text_utils import COMPETENCY_RE
 from teacherfactory.validation import validate_competencies
 from teacherfactory.views.common import get_provider_for_session, index_ready
 from teacherfactory.views.errors import format_exception, show_error
 
-LESSON_TYPES = [
-    "комбинированный урок",
-    "урок изучения нового материала",
-    "урок закрепления знаний",
-    "урок обобщения и систематизации знаний",
-    "урок контроля знаний",
-]
+LESSON_TYPE_AUTO = "Авто (определит ИИ)"
+LESSON_TYPES = (LESSON_TYPE_AUTO, *LESSON_TYPE_CHOICES)
 
 LESSON_KINDS = [
     "лекция",
@@ -52,6 +48,16 @@ def make_lesson_params(
     lesson_kind: str,
     duration: int,
 ) -> dict:
+    """
+    Собрать словарь параметров для пайплайна генерации карты.
+
+    `lesson_type` может быть LESSON_TYPE_AUTO — тогда в промпт уходит
+    подсказка «выбери сам», и модель сама проставит поле в LessonCard.
+    """
+    if lesson_type == LESSON_TYPE_AUTO:
+        type_hint = LESSON_TYPE_AUTO_HINT
+    else:
+        type_hint = lesson_type
     return {
         "discipline": discipline,
         "specialty": specialty,
@@ -62,25 +68,10 @@ def make_lesson_params(
         "lesson_number": number,
         "date": lesson_date.strftime("%d.%m.%Y"),
         "teacher_name": teacher,
-        "lesson_type": lesson_type,
+        "lesson_type_hint": type_hint,
         "lesson_kind": lesson_kind,
         "duration": duration,
     }
-
-
-def _render_competencies(text: str, validation: dict[str, bool]) -> None:
-    """Выводит текст компетенций, подсвечивая непроверенные коды."""
-    if not text or text.strip() == "Не указано в документах":
-        st.markdown(f"*{text}*")
-        return
-
-    for line in text.strip().splitlines():
-        codes_in_line = COMPETENCY_RE.findall(line)
-        if not codes_in_line:
-            st.markdown(line)
-            continue
-        unverified = [c for c in codes_in_line if validation.get(c) is False]
-        st.markdown(f"{'⚠️' if unverified else '✅'} {line}")
 
 
 def render(teacher: str, specialty: str, course: int, group: str, students: int) -> None:
@@ -89,7 +80,11 @@ def render(teacher: str, specialty: str, course: int, group: str, students: int)
     with col1:
         discipline = st.text_input("Дисциплина / МДК", "Компьютерные сети")
         topic = st.text_input("Тема занятия", "Основы сетевых протоколов")
-        lesson_type = st.selectbox("Тип урока", LESSON_TYPES)
+        lesson_type = st.selectbox(
+            "Тип урока",
+            LESSON_TYPES,
+            help="«Авто» — модель выберет подходящий тип на основе темы и вида занятия.",
+        )
         lesson_kind = st.selectbox("Вид занятия", LESSON_KINDS)
 
     with col2:
@@ -174,7 +169,7 @@ def render(teacher: str, specialty: str, course: int, group: str, students: int)
 
 
 def _render_preview() -> None:
-    card = st.session_state["single_card"]
+    card: LessonCard = st.session_state["single_card"]
     fname = st.session_state["single_fname"]
     validation: dict[str, bool] = st.session_state.get("validation", {})
 
@@ -188,22 +183,36 @@ def _render_preview() -> None:
         )
 
     with st.expander("Предпросмотр"):
+        st.markdown(f"**Тип урока:** {card.lesson_type}")
+        st.markdown(f"**Вид занятия:** {card.lesson_kind}")
         st.markdown(f"**Цель:** {card.goal}")
+        if card.epigraph:
+            st.markdown(f"> *«{card.epigraph}»* — {card.epigraph_author}")
 
-        st.markdown("**Общие компетенции (ОК):**")
-        _render_competencies(card.competencies_ok, validation)
-        st.markdown("**Профессиональные компетенции (ПК):**")
-        _render_competencies(card.competencies_pk, validation)
+        st.markdown("**Компетенции:**")
+        for comp in card.competencies:
+            ok = validation.get(comp.code)
+            icon = "⚠️" if ok is False else "✅" if ok is True else "•"
+            st.markdown(f"{icon} **{comp.code}** — {comp.name}")
+            st.caption(comp.indicator)
+
+        st.markdown("**Результаты обучения (З/У/Н):**")
+        for out in card.learning_outcomes:
+            st.markdown(f"- **{out.code}** ({out.type}) — {out.name}")
+            st.caption(out.indicator)
 
         st.divider()
         st.markdown("**Ход занятия:**")
         for s in card.lesson_structure:
-            with st.expander(f"{s.number}. {s.stage} — {s.time}"):
+            with st.expander(f"{s.number}. {s.stage} — {s.substage} ({s.time} мин)"):
                 c1, c2 = st.columns(2)
-                c1.markdown(f"**Преподаватель:**\n\n{s.teacher}")
-                c1.markdown(f"**Методы:** {s.methods}")
-                c2.markdown(f"**Студенты:**\n\n{s.student}")
-                c2.markdown(f"**Результат:** {s.result}")
+                c1.markdown(f"**Задачи этапа:**\n\n{s.tasks}")
+                c1.markdown(f"**Деятельность преподавателя:**\n\n{s.teacher}")
+                c1.markdown(f"**Приёмы:** {s.methods}")
+                c1.markdown(f"**Средства:** {s.means}")
+                c2.markdown(f"**Результат:**\n\n{s.result}")
+                c2.markdown(f"**Деятельность студентов:**\n\n{s.student}")
+                c2.markdown(f"**Контроль:** {s.control}")
 
     st.download_button(
         label="Скачать DOCX",

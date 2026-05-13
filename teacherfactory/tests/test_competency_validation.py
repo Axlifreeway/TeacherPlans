@@ -1,16 +1,18 @@
 """
 Тесты валидации компетенций:
   - регулярное выражение для извлечения кодов
-  - логика проверки наличия кода в контексте
+  - логика проверки наличия кода в индексе
   - пограничные случаи (нет кодов, форматы написания)
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import patch
 
 from langchain_core.documents import Document
 
+from teacherfactory.model import Competency
 from teacherfactory.text_utils import COMPETENCY_RE, normalize_code
 from teacherfactory.validation import validate_competencies
+from tests.conftest import build_stub_card
 
 # ─── COMPETENCY_RE ────────────────────────────────────────────────────────────
 
@@ -30,7 +32,6 @@ def test_regex_finds_pk_codes():
 
 
 def test_regex_finds_no_space_format():
-    """Некоторые документы пишут без пробела: ОК01, ПК12."""
     codes = COMPETENCY_RE.findall("ОК01 ПК12")
     assert len(codes) == 2
 
@@ -47,19 +48,15 @@ def test_regex_handles_mixed_text():
     assert len(codes) == 4
 
 
-# ─── validate_competencies ────────────────────────────────────────────────────
+# ─── validate_competencies (на новой модели со списком Competency) ───────────
 
 
-def _make_card(ok: str = "", pk: str = "") -> MagicMock:
-    card = MagicMock()
-    card.competencies_ok = ok
-    card.competencies_pk = pk
-    return card
+def _card_with(*comps: Competency):
+    return build_stub_card(competencies=list(comps))
 
 
 def test_validation_finds_existing_code(mock_faiss, bm25_data):
-    """Код, реально присутствующий в документах, должен быть помечен как найденный."""
-    card = _make_card(ok="ОК 01 Выбирать способы решения задач")
+    card = _card_with(Competency(code="ОК 01", name="Выбирать способы", indicator="..."))
 
     with patch("teacherfactory.validation.load_index", return_value=(mock_faiss, bm25_data)):
         result = validate_competencies(card)
@@ -69,8 +66,7 @@ def test_validation_finds_existing_code(mock_faiss, bm25_data):
 
 
 def test_validation_flags_missing_code(mock_faiss, bm25_data):
-    """Выдуманный код, которого нет в документах, должен быть помечен как не найденный."""
-    card = _make_card(ok="ОК 99 Несуществующая компетенция")
+    card = _card_with(Competency(code="ОК 99", name="Несуществующая", indicator="..."))
 
     mock_faiss.similarity_search.return_value = [
         Document(page_content="ОК 01 Выбирать способы решения", metadata={})
@@ -85,7 +81,7 @@ def test_validation_flags_missing_code(mock_faiss, bm25_data):
 
 def test_validation_empty_card(mock_faiss, bm25_data):
     """Карта без компетенций не должна вызывать ошибку."""
-    card = _make_card(ok="Не указано в документах", pk="")
+    card = build_stub_card(competencies=[])
 
     with patch("teacherfactory.validation.load_index", return_value=(mock_faiss, bm25_data)):
         result = validate_competencies(card)
@@ -94,8 +90,11 @@ def test_validation_empty_card(mock_faiss, bm25_data):
 
 
 def test_validation_deduplicates_codes(mock_faiss, bm25_data):
-    """Один и тот же код в ОК и ПК полях не должен проверяться дважды."""
-    card = _make_card(ok="ОК 01 текст ОК 01 дубль", pk="")
+    """Один и тот же код в двух разных Competency не должен проверяться дважды."""
+    card = _card_with(
+        Competency(code="ОК 01", name="дубль 1", indicator="..."),
+        Competency(code="ОК 01", name="дубль 2", indicator="..."),
+    )
 
     with (
         patch("teacherfactory.validation.load_index", return_value=(mock_faiss, bm25_data)),
@@ -110,7 +109,6 @@ def test_validation_deduplicates_codes(mock_faiss, bm25_data):
 
 
 def test_normalize_code_strips_whitespace():
-    """ОК 01 и ОК01 должны давать один и тот же ключ."""
     assert normalize_code("ОК 01") == "ОК01"
     assert normalize_code("ОК01") == "ОК01"
     assert normalize_code("ПК 1.2") == "ПК1.2"

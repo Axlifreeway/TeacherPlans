@@ -22,6 +22,13 @@ BM25_PATH = INDEX_DIR / "bm25.json"
 SKIPPED_DOC_PATH = INDEX_DIR / "skipped_doc_files.txt"
 OUTPUT_DIR = USER_DATA_DIR / "output"
 
-# Шаблон технологической карты урока остался в корне для совместимости.
-# Новые шаблоны (РПД, аттестация и т.п.) кладите в templates/.
-LESSON_CARD_TEMPLATE = PROJECT_ROOT / "template_fixed.docx"
+# Активный шаблон технологической карты урока — собирается из docx Алёшкина
+# скриптом `scratch/make_template_v2.py`. Старое имя ALESHIKN_TEMPLATE
+# сохранено как алиас для обратной совместимости с user-кодом, успевшим
+# на него сослаться.
+LESSON_CARD_TEMPLATE = DOCS_DIR / "template_aleshkin_v2.docx"
+ALESHKIN_TEMPLATE = LESSON_CARD_TEMPLATE
+ALESHIKN_TEMPLATE = LESSON_CARD_TEMPLATE  # noqa: deprecated alias, исправлена опечатка
+
+# Шаблон оценочных материалов (КОС/ФОС). Собирается отдельным скриптом.
+ASSESSMENT_TEMPLATE = TEMPLATES_DIR / "template_assessment.docx"

@@ -20,61 +20,20 @@ from langchain_core.documents import Document
 from rank_bm25 import BM25Okapi
 
 from teacherfactory.documents.lesson_card import LESSON_CARD
-from teacherfactory.model import LessonCard, LessonStep, LessonTasks, PlannedOutcomes, Resources
+from teacherfactory.model import LessonCard
 from teacherfactory.pipeline import generate_document, stream_chat_response
 from teacherfactory.retrieval import BM25Index
+from tests.conftest import build_stub_card
 
 # ─── Фикстуры ─────────────────────────────────────────────────────────────────
 
 
 def _stub_lesson_card() -> LessonCard:
     """Сэмпл валидного LessonCard, как если бы его вернул LLM."""
-    return LessonCard(
-        lesson_number=1,
-        date="08.05.2026",
-        group_name="ОИСИР-21",
-        students_count=25,
+    return build_stub_card(
         discipline="Компьютерные сети",
         specialty="09.01.03 Оператор ИС",
-        course_number=2,
         lesson_topic="Основы TCP/IP",
-        lesson_type="комбинированный урок",
-        lesson_kind="лекция",
-        duration=90,
-        teacher_name="Иванов И.И.",
-        goal="Сформировать представление о TCP/IP",
-        tasks=LessonTasks(
-            educational="Изучить TCP/IP",
-            developmental="Развить аналитическое мышление",
-            upbringing="Воспитать ответственность",
-            pedagogical="Применить проблемное обучение",
-        ),
-        competencies_ok="ОК 01 Выбирать способы решения задач",
-        competencies_pk="ПК 1.6 Формировать запросы",
-        outcomes=PlannedOutcomes(
-            knowledge_indicator="знает уровни OSI",
-            knowledge_control="устный опрос",
-            skill_indicator="умеет настраивать IP",
-            skill_control="практическая работа",
-            ability_indicator="владеет утилитой ping",
-            ability_control="демонстрация",
-        ),
-        resources=Resources(
-            literature="Олифер В.Г.",
-            internet_resources="rfc-editor.org",
-            other_materials="ПК с Linux",
-        ),
-        lesson_structure=[
-            LessonStep(
-                number=1,
-                stage="Орг. момент",
-                time="5 мин",
-                teacher="Приветствует",
-                student="Готовятся",
-                methods="Беседа",
-                result="Готовы",
-            ),
-        ],
     )
 
 
@@ -91,7 +50,7 @@ def valid_params() -> dict:
         "lesson_number": 1,
         "date": "08.05.2026",
         "teacher_name": "Иванов И.И.",
-        "lesson_type": "комбинированный урок",
+        "lesson_type_hint": "комбинированный урок",
         "lesson_kind": "лекция",
         "duration": 90,
     }

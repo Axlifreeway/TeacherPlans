@@ -26,7 +26,6 @@ dependencies = [
 
 [project.scripts]
 teacherfactory-index = "teacherfactory.indexer:main"
-teacherfactory-rebuild-template = "teacherfactory.rebuild_template:build_template"
 
 [tool.poetry]
 packages = [{include = "teacherfactory", from = "src"}]
@@ -124,7 +123,6 @@ source = ["src/teacherfactory"]
 omit = [
     "src/teacherfactory/app.py",            # UI entry — тестируется руками
     "src/teacherfactory/views/*",           # Streamlit-вьюхи — мокать не имеет смысла
-    "src/teacherfactory/rebuild_template.py",
 ]
 
 [tool.coverage.report]

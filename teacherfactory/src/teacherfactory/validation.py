@@ -21,13 +21,11 @@ def validate_competencies(card: LessonCard) -> dict[str, bool]:
     Возвращает {код: найден_ли_в_документах}.
     Коды, которых нет в индексе — скорее всего выдуманы LLM.
     """
-    db, bm25_data = load_index()
-    all_text = f"{card.competencies_ok} {card.competencies_pk}"
-    codes = list(set(COMPETENCY_RE.findall(all_text)))
-
+    codes = _collect_codes(card)
     if not codes:
         return {}
 
+    db, bm25_data = load_index()
     results: dict[str, bool] = {}
     for code in codes:
         context = retrieve_context(db, bm25_data, code, k=3)
@@ -36,3 +34,18 @@ def validate_competencies(card: LessonCard) -> dict[str, bool]:
         log.info("Компетенция %s: %s", code, "найдена" if found else "НЕ НАЙДЕНА в документах")
 
     return results
+
+
+def _collect_codes(card: LessonCard) -> list[str]:
+    """
+    Собрать уникальные коды компетенций из карты.
+
+    Источники:
+      - поле `code` в каждой Competency (основное);
+      - текст в `name`/`indicator` — если LLM по ошибке упомянула там код.
+    """
+    found: set[str] = set()
+    for comp in card.competencies:
+        for code in COMPETENCY_RE.findall(f"{comp.code} {comp.name} {comp.indicator}"):
+            found.add(code)
+    return list(found)

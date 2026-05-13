@@ -137,12 +137,24 @@ class GroqProvider(LLMProvider):
         if self.config.api_key is None:
             raise ValueError("Groq API ключ не настроен")
 
-        return ChatGroq(
-            api_key=self.config.api_key,  # ChatGroq принимает SecretStr напрямую
-            model=self.config.model_name,
-            temperature=self.config.temperature,
-            streaming=True,
-        )
+        # Reasoning-модели (deepseek-r1*) тратят токены на <think>...</think>
+        # перед tool call; обычным моделям 8K хватает с запасом.
+        is_reasoning = "deepseek-r1" in self.config.model_name.lower()
+        max_out = 16384 if is_reasoning else 8192
+
+        kwargs: dict[str, Any] = {
+            "api_key": self.config.api_key,  # ChatGroq принимает SecretStr напрямую
+            "model": self.config.model_name,
+            "temperature": self.config.temperature,
+            "streaming": True,
+            "max_tokens": max_out,
+        }
+        # reasoning_format="hidden" прячет <think>-блок на стороне Groq,
+        # чтобы он не мешал langchain распарсить tool call.
+        if is_reasoning:
+            kwargs["reasoning_format"] = "hidden"
+
+        return ChatGroq(**kwargs)
 
     def is_available(self) -> bool:
         return self.config.api_key is not None

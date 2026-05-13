@@ -1,77 +1,51 @@
 """
 Тесты модели LessonCard:
-  - to_template_context включает все ключи, на которые ссылается шаблон;
-  - вложенные модели (tasks, outcomes, resources) разворачиваются плоско;
-  - lesson_structure становится списком dict (для {%tr for %} в docxtpl).
+  - to_template_context выдаёт ключи, на которые ссылается шаблон;
+  - вложенные модели (tasks, taula методов) разворачиваются плоско;
+  - таблицы (learning_outcomes, competencies, lesson_structure, межсвязи)
+    становятся списками dict (для {%tr for %} в docxtpl).
 """
 
 import pytest
 
 from teacherfactory.documents.lesson_card import LESSON_CARD
-from teacherfactory.model import LessonCard, LessonStep, LessonTasks, PlannedOutcomes, Resources
+from teacherfactory.model import LessonCard
+from tests.conftest import build_stub_card
 
 
 @pytest.fixture
 def card() -> LessonCard:
-    return LessonCard(
-        lesson_number=1,
-        date="01.01.2026",
-        group_name="G",
-        students_count=1,
-        discipline="D",
-        specialty="S",
-        course_number=1,
-        lesson_topic="T",
-        lesson_type="L",
-        lesson_kind="K",
-        duration=45,
-        teacher_name="N",
-        goal="G",
-        tasks=LessonTasks(educational="e", developmental="d", upbringing="u", pedagogical="p"),
-        competencies_ok="ОК 01",
-        competencies_pk="ПК 1.2",
-        outcomes=PlannedOutcomes(
-            knowledge_indicator="ki",
-            knowledge_control="kc",
-            skill_indicator="si",
-            skill_control="sc",
-            ability_indicator="ai",
-            ability_control="ac",
-        ),
-        resources=Resources(literature="l", internet_resources="i", other_materials="o"),
-        lesson_structure=[
-            LessonStep(
-                number=1, stage="s", time="t", teacher="te", student="st", methods="m", result="r"
-            ),
-        ],
-    )
+    return build_stub_card()
 
 
 def test_to_template_context_flattens_tasks(card):
     ctx = card.to_template_context()
-    assert ctx["task_educational"] == "e"
-    assert ctx["task_developmental"] == "d"
-    assert ctx["task_upbringing"] == "u"
-    assert ctx["task_pedagogical"] == "p"
+    assert "task_educational" in ctx
+    assert "task_developmental" in ctx
+    assert "task_upbringing" in ctx
+    assert "task_perspective" in ctx
+    assert "task_personal" in ctx
     # tasks как объект НЕ должен остаться в плоском контексте
     assert "tasks" not in ctx
 
 
-def test_to_template_context_flattens_outcomes(card):
+def test_to_template_context_flattens_methods_table(card):
     ctx = card.to_template_context()
-    assert ctx["knowledge_indicator"] == "ki"
-    assert ctx["knowledge_control"] == "kc"
-    assert ctx["skill_indicator"] == "si"
-    assert ctx["ability_control"] == "ac"
-    assert "outcomes" not in ctx
+    assert "method_source" in ctx
+    assert "method_character" in ctx
+    assert "method_independence" in ctx
+    assert "method_health" in ctx
+    assert "teaching_methods_table" not in ctx
 
 
-def test_to_template_context_flattens_resources(card):
+def test_to_template_context_lists_are_present(card):
     ctx = card.to_template_context()
-    assert ctx["literature"] == "l"
-    assert ctx["internet_resources"] == "i"
-    assert ctx["other_materials"] == "o"
-    assert "resources" not in ctx
+    assert isinstance(ctx["learning_outcomes"], list)
+    assert isinstance(ctx["competencies"], list)
+    assert isinstance(ctx["interdisciplinary_connections"], list)
+    assert isinstance(ctx["lesson_structure"], list)
+    assert isinstance(ctx["learning_outcomes"][0], dict)
+    assert ctx["competencies"][0]["code"] == "ОК 01"
 
 
 def test_to_template_context_lesson_structure_is_list_of_dicts(card):
@@ -79,28 +53,37 @@ def test_to_template_context_lesson_structure_is_list_of_dicts(card):
     structure = ctx["lesson_structure"]
     assert isinstance(structure, list)
     assert isinstance(structure[0], dict)
-    assert structure[0]["stage"] == "s"
+    assert structure[0]["stage"] == "Орг"
     assert structure[0]["number"] == 1
+
+
+def test_to_template_context_resources_are_strings(card):
+    """Списочные ресурсы превращаются в готовую к выводу строку с маркерами."""
+    ctx = card.to_template_context()
+    assert isinstance(ctx["lit_main"], str)
+    assert isinstance(ctx["databases"], str)
+    assert ctx["lit_main"].startswith("— ")
+    assert "resources" not in ctx  # объект не должен утечь в плоский ctx
 
 
 def test_template_context_has_all_top_level_fields(card):
     ctx = card.to_template_context()
     expected = {
-        "lesson_number",
-        "date",
-        "group_name",
-        "students_count",
         "discipline",
         "specialty",
         "course_number",
+        "group_name",
+        "students_count",
         "lesson_topic",
         "lesson_type",
         "lesson_kind",
         "duration",
         "teacher_name",
+        "pedagogical_technologies",
         "goal",
-        "competencies_ok",
-        "competencies_pk",
+        "epigraph",
+        "epigraph_author",
+        "teaching_means",
     }
     assert expected.issubset(ctx.keys())
 
