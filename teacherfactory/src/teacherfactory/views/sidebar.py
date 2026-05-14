@@ -24,14 +24,17 @@ def render_sidebar() -> tuple[str, str, int, str, int]:
         st.error("❌ Ни один LLM-провайдер не доступен.")
         st.info(
             "**Как настроить:**\n\n"
-            "- **Ollama**: запустите `ollama serve` и загрузите модель.\n"
-            "- **Groq**: добавьте API-ключ в `config.local.toml` "
-            "или в переменную окружения `GROQ_API_KEY`.\n\n"
-            "Бесплатный ключ Groq: https://console.groq.com/keys"
+            "- **Groq**: `[groq].api_key` в `config.local.toml` или `GROQ_API_KEY`.\n"
+            "  Бесплатный ключ: https://console.groq.com/keys\n"
+            "- **OpenRouter**: `[openrouter].api_key` или `OPENROUTER_API_KEY`.\n"
+            "  Бесплатный ключ: https://openrouter.ai/keys\n"
+            "- **Ollama**: запустите `ollama serve` и загрузите модель."
         )
         st.stop()
 
     current_type = st.session_state.get("selected_llm_type")
+    # По умолчанию выбираем Авто-fallback (он всегда первым в списке, если
+    # хоть один из реальных провайдеров доступен).
     default_idx = next(
         (i for i, p in enumerate(available) if p["type"] == current_type),
         0,
@@ -42,7 +45,10 @@ def render_sidebar() -> tuple[str, str, int, str, int]:
         options=range(len(available)),
         format_func=lambda i: f"{available[i]['name']} ({available[i]['model']})",
         index=default_idx,
-        help="Groq — быстро, требует интернет. Ollama — локально, приватно.",
+        help=(
+            "Авто (fallback) — по очереди Groq → OpenRouter → Ollama, "
+            "переключается при rate-limit. Конкретный провайдер — без переключения."
+        ),
     )
 
     new_type = available[selected_idx]["type"]

@@ -22,6 +22,12 @@ BM25_PATH = INDEX_DIR / "bm25.json"
 SKIPPED_DOC_PATH = INDEX_DIR / "skipped_doc_files.txt"
 OUTPUT_DIR = USER_DATA_DIR / "output"
 
+# Хранилище учётных записей (вне репозитория, права 0o600).
+# JSON с argon2id-хешами паролей. См. teacherfactory.auth.
+AUTH_DIR = USER_DATA_DIR / "auth"
+USERS_FILE = AUTH_DIR / "users.json"
+AUTH_LOG = AUTH_DIR / "auth.log"
+
 # Активный шаблон технологической карты урока — собирается из docx Алёшкина
 # скриптом `scratch/make_template_v2.py`. Старое имя ALESHIKN_TEMPLATE
 # сохранено как алиас для обратной совместимости с user-кодом, успевшим

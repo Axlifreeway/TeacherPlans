@@ -50,6 +50,25 @@ hf_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 #
 # Лимиты Free Tier (RPM/RPD/TPM) — см. https://console.groq.com/docs/rate-limits
 
+[openrouter]
+# API-ключ OpenRouter (бесплатный: https://openrouter.ai/keys).
+# Класть сюда коммит-в-репо нельзя — используй config.local.toml или
+# переменную окружения OPENROUTER_API_KEY.
+# api_key = "sk-or-v1-..."
+# model = "meta-llama/llama-3.3-70b-instruct:free"
+# base_url = "https://openrouter.ai/api/v1"
+#
+# Хорошие :free модели (общая квота ~20 RPM, бесплатно):
+#   - meta-llama/llama-3.3-70b-instruct:free       (дефолт, 70B)
+#   - deepseek/deepseek-chat-v3.1:free             (сильный reasoning)
+#   - qwen/qwen-2.5-72b-instruct:free              (72B, мощный)
+#   - google/gemini-2.0-flash-exp:free             (быстрый)
+#   - mistralai/mistral-small-3.2-24b-instruct:free
+#
+# Платные модели работают без waitlist'ов и rate-limit'ов :free,
+# стоят $0.x — $few за миллион токенов. Список и цены:
+# https://openrouter.ai/models
+
 [rag]
 chunk_size = 800
 chunk_overlap = 200

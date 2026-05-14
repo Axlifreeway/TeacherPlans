@@ -35,7 +35,7 @@ from sentence_transformers import CrossEncoder
 from teacherfactory.config import CONFIG
 from teacherfactory.embeddings import get_embeddings
 from teacherfactory.paths import BM25_PATH, INDEX_DIR
-from teacherfactory.text_utils import tokenize
+from teacherfactory.text_utils import SPECIALTY_CODE_RE, tokenize
 
 log = logging.getLogger(__name__)
 
@@ -136,11 +136,28 @@ def load_index() -> tuple[FAISS, BM25Index | None]:
 # ─── Основной поиск ───────────────────────────────────────────────────────────
 
 
+def _source_matches_specialty(doc: Document, code_norm: str) -> bool:
+    """True, если в имени файла-источника зашит код специальности."""
+    src = doc.metadata.get("source", "")
+    src_norm = src.replace(".", "").replace("_", "").replace(" ", "").replace("-", "")
+    return code_norm in src_norm
+
+
+def _extract_specialty(queries: list[str]) -> str | None:
+    """Ищет код специальности в любом из запросов мультизапроса."""
+    for q in queries:
+        m = SPECIALTY_CODE_RE.search(q)
+        if m:
+            return m.group()
+    return None
+
+
 def retrieve_context(
     db: FAISS,
     bm25_index: BM25Index | None,
     query: str | list[str],
     k: int | None = None,
+    specialty: str | None = None,
 ) -> str:
     """
     Трёхступенчатый поиск: FAISS + BM25 → RRF → cross-encoder reranking.
@@ -148,6 +165,14 @@ def retrieve_context(
     query может быть строкой или списком строк (мультизапрос). При
     мультизапросе результаты по всем запросам объединяются через RRF,
     что улучшает покрытие документа.
+
+    specialty — код специальности («09.01.03» и т.п.) для фильтрации
+    кандидатов по имени файла. Если не передан, ищется в самих запросах.
+    Чанки, у которых в `metadata.source` нет этого кода, штрафуются на
+    финальном этапе — это лечит «утечку» материала из РПД другой
+    специальности (одни и те же ФГОС-формулировки между специальностями
+    семантически неразличимы, без жёсткого фильтра модель таскает
+    компетенции из чужих РПД).
     """
     if k is None:
         k = CONFIG["rag"]["retrieval_k"]
@@ -155,6 +180,9 @@ def retrieve_context(
     queries = [query] if isinstance(query, str) else query
     candidates = CONFIG["rag"].get("retrieval_candidates", k * 4)
     per_query = max(candidates // len(queries), k)
+
+    code = specialty or _extract_specialty(queries)
+    code_norm = code.replace(".", "") if code else None
 
     score_map: dict[str, float] = {}
     doc_map: dict[str, Document] = {}
@@ -187,20 +215,51 @@ def retrieve_context(
     rrf_top = sorted(score_map, key=score_map.__getitem__, reverse=True)[:candidates]
     candidate_docs = [doc_map[key] for key in rrf_top]
 
+    # Жёсткий приоритет документов нужной специальности.
+    # Сначала отделяем «свои» от «чужих»; reranker запускаем по обоим
+    # подмножествам, потом склеиваем — сначала свои, потом чужие. Если
+    # своих набралось ≥ k, чужие в финал не идут вовсе. Если своих
+    # меньше k — добиваем чужими (это нужно для общих документов, у
+    # которых в имени нет кода специальности — например, ФГОСы и
+    # сводные методички).
+    if code_norm:
+        own = [d for d in candidate_docs if _source_matches_specialty(d, code_norm)]
+        other = [d for d in candidate_docs if not _source_matches_specialty(d, code_norm)]
+        log.info(
+            "Фильтр по специальности %s: %d своих / %d прочих из %d кандидатов",
+            code,
+            len(own),
+            len(other),
+            len(candidate_docs),
+        )
+    else:
+        own, other = candidate_docs, []
+
     primary_query = queries[0]
     reranker = _get_reranker()
-    if reranker and len(candidate_docs) > k:
-        pairs = [(primary_query, doc.page_content) for doc in candidate_docs]
-        rerank_scores = reranker.predict(pairs)
-        ranked = sorted(
-            zip(rerank_scores, candidate_docs, strict=True),
-            key=lambda x: x[0],
-            reverse=True,
+
+    def _rerank(docs: list[Document], limit: int) -> list[Document]:
+        if not docs:
+            return []
+        if not reranker or len(docs) <= limit:
+            return docs[:limit]
+        pairs = [(primary_query, d.page_content) for d in docs]
+        scores = reranker.predict(pairs)
+        ranked = sorted(zip(scores, docs, strict=True), key=lambda x: x[0], reverse=True)
+        return [d for _, d in ranked[:limit]]
+
+    own_top = _rerank(own, k)
+    remaining = k - len(own_top)
+    other_top = _rerank(other, remaining) if remaining > 0 else []
+    top_docs = own_top + other_top
+
+    if reranker:
+        log.info(
+            "Reranking: %d своих + %d прочих → топ-%d",
+            len(own_top),
+            len(other_top),
+            len(top_docs),
         )
-        top_docs = [doc for _, doc in ranked[:k]]
-        log.info("Reranking: %d кандидатов → топ-%d", len(candidate_docs), k)
-    else:
-        top_docs = candidate_docs[:k]
 
     return _format_docs(top_docs)
 

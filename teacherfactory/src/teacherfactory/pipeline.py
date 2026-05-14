@@ -28,6 +28,13 @@ from teacherfactory.retrieval import (
 )
 from teacherfactory.text_utils import LIST_INTENT_RE, SPECIALTY_CODE_RE
 
+
+def _specialty_code_from_params(params: dict) -> str | None:
+    """Достаёт код специальности из параметров (поле может быть «09.01.03 ...»)."""
+    raw = params.get("specialty") or ""
+    m = SPECIALTY_CODE_RE.search(str(raw))
+    return m.group() if m else None
+
 log = logging.getLogger(__name__)
 
 
@@ -78,8 +85,14 @@ def generate_document[T: BaseModel](
 
     _stage("context")
     queries = doc_type.build_queries(params)
-    log.info("Мультизапрос для '%s': %d вариантов", doc_type.slug, len(queries))
-    context = retrieve_context(db, bm25_data, queries)
+    specialty = _specialty_code_from_params(params)
+    log.info(
+        "Мультизапрос для '%s': %d вариантов, фильтр по специальности: %s",
+        doc_type.slug,
+        len(queries),
+        specialty or "—",
+    )
+    context = retrieve_context(db, bm25_data, queries, specialty=specialty)
 
     _stage("generate")
     if provider is None:

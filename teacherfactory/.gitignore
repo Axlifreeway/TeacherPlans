@@ -36,6 +36,12 @@ ENV/
 # Project specific
 config.local.toml
 .env
+# Учётные записи и аудит — на случай, если кто-то случайно перенесёт каталог
+# ~/.teacherfactory/ в репо. Реальное хранилище и так вне репозитория.
+users.json
+auth.log
+admin_bootstrap.txt
+auth/
 *.docx
 *.pdf
 *.doc

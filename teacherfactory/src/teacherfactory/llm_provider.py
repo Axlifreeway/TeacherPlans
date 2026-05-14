@@ -2,8 +2,9 @@
 Единый интерфейс для LLM-провайдеров.
 
 Поддерживает:
+- Groq (облако, бесплатный тариф, быстро)
+- OpenRouter (облако, OpenAI-совместимый API, много моделей включая :free)
 - Ollama (локально)
-- Groq (облако, бесплатный тариф)
 
 Использование:
     from llm_provider import get_llm_provider, LLMProviderType
@@ -13,6 +14,12 @@
 
     for chunk in provider.stream_chat(messages):
         print(chunk, end="")
+
+Fallback-цепочка:
+    provider = get_llm_provider(LLMProviderType.FALLBACK)
+    # Внутри: Groq → OpenRouter → Ollama (порядок — по доступности).
+    # При rate-limit / сетевой ошибке langchain автоматически
+    # перебирает провайдеров через Runnable.with_fallbacks.
 """
 
 import logging
@@ -33,6 +40,8 @@ log = logging.getLogger(__name__)
 class LLMProviderType(StrEnum):
     OLLAMA = "ollama"
     GROQ = "groq"
+    OPENROUTER = "openrouter"
+    FALLBACK = "fallback"  # цепочка Groq → OpenRouter → Ollama
 
 
 class ProviderConfig(BaseModel):
@@ -160,12 +169,109 @@ class GroqProvider(LLMProvider):
         return self.config.api_key is not None
 
 
+class OpenRouterProvider(LLMProvider):
+    """OpenAI-совместимый шлюз к десяткам моделей.
+
+    Free-tier: модели с суффиксом ":free" (общая квота ~20 RPM, без оплаты).
+    Платные модели стоят дёшево, но требуют пополнения баланса.
+    Документация: https://openrouter.ai/docs
+    """
+
+    @property
+    def name(self) -> str:
+        return "OpenRouter"
+
+    def _create_client(self) -> Any:
+        from langchain_openai import ChatOpenAI
+
+        if self.config.api_key is None:
+            raise ValueError("OpenRouter API ключ не настроен")
+
+        # OpenRouter рекомендует указывать заголовки HTTP-Referer и X-Title
+        # для атрибуции трафика и попадания в их лидерборд приложений.
+        default_headers = {
+            "HTTP-Referer": "https://github.com/Axlifreeway/teacherfactory",
+            "X-Title": "TeacherFactory",
+        }
+        return ChatOpenAI(
+            api_key=self.config.api_key,
+            model=self.config.model_name,
+            base_url=self.config.base_url or "https://openrouter.ai/api/v1",
+            temperature=self.config.temperature,
+            streaming=True,
+            max_tokens=8192,
+            default_headers=default_headers,
+        )
+
+    def is_available(self) -> bool:
+        return self.config.api_key is not None
+
+
+# ─── Fallback-цепочка ─────────────────────────────────────────────────────────
+
+
+# Какие исключения трактуем как «попробуй следующий провайдер».
+# Импортируем лениво, чтобы не тянуть зависимости провайдеров до использования.
+def _fallback_exceptions() -> tuple[type[BaseException], ...]:
+    excs: list[type[BaseException]] = [TimeoutError, ConnectionError]
+    # Groq / OpenAI поднимают свои подклассы; импорт ленивый, чтобы не падать,
+    # если соответствующий пакет не установлен.
+    try:
+        from groq import APIError as GroqAPIError, APIStatusError as GroqAPIStatusError
+
+        excs.extend([GroqAPIError, GroqAPIStatusError])
+    except ImportError:
+        pass
+    try:
+        from openai import APIError as OpenAIAPIError, APIStatusError as OpenAIAPIStatusError
+
+        excs.extend([OpenAIAPIError, OpenAIAPIStatusError])
+    except ImportError:
+        pass
+    return tuple(excs)
+
+
+class FallbackProvider(LLMProvider):
+    """Цепочка из нескольких провайдеров. Первый — основной, остальные —
+    подменяют его при rate-limit/сетевой ошибке через `Runnable.with_fallbacks`.
+
+    Имена/модель отражают первого; `.config` берётся у него же, чтобы внешний
+    код (например, логирование) видел осмысленные значения.
+    """
+
+    def __init__(self, primary: LLMProvider, fallbacks: list[LLMProvider]):
+        super().__init__(primary.config)
+        self.primary = primary
+        self.fallbacks = fallbacks
+
+    @property
+    def name(self) -> str:
+        chain = " → ".join([self.primary.name, *(f.name for f in self.fallbacks)])
+        return f"Fallback ({chain})"
+
+    def is_available(self) -> bool:
+        return self.primary.is_available() or any(f.is_available() for f in self.fallbacks)
+
+    def _create_client(self) -> Any:
+        excs = _fallback_exceptions()
+        base = self.primary.get_client()
+        fbs = [f.get_client() for f in self.fallbacks]
+        if not fbs:
+            return base
+        return base.with_fallbacks(fbs, exceptions_to_handle=excs)
+
+
 # ─── Фабрика ──────────────────────────────────────────────────────────────────
 
 
 def _groq_api_key(config_dict: dict) -> SecretStr | None:
     """Берёт ключ Groq из конфига или переменной окружения."""
     raw = config_dict.get("groq", {}).get("api_key") or os.getenv("GROQ_API_KEY")
+    return SecretStr(raw) if raw else None
+
+
+def _openrouter_api_key(config_dict: dict) -> SecretStr | None:
+    raw = config_dict.get("openrouter", {}).get("api_key") or os.getenv("OPENROUTER_API_KEY")
     return SecretStr(raw) if raw else None
 
 
@@ -186,6 +292,15 @@ def _make_config(
                 api_key=_groq_api_key(config_dict),
                 temperature=temp,
             )
+        if provider_type == LLMProviderType.OPENROUTER:
+            or_cfg = config_dict.get("openrouter", {})
+            return ProviderConfig(
+                provider_type=LLMProviderType.OPENROUTER,
+                model_name=or_cfg.get("model", "meta-llama/llama-3.3-70b-instruct:free"),
+                api_key=_openrouter_api_key(config_dict),
+                base_url=or_cfg.get("base_url", "https://openrouter.ai/api/v1"),
+                temperature=temp,
+            )
         return ProviderConfig(
             provider_type=LLMProviderType.OLLAMA,
             model_name=model_cfg["llm"],
@@ -198,38 +313,74 @@ def _make_config(
         raise
 
 
+def _single_provider(
+    provider_type: LLMProviderType,
+    cfg: dict,
+    temperature: float | None,
+) -> LLMProvider:
+    config = _make_config(provider_type, cfg, temperature=temperature)
+    if provider_type == LLMProviderType.GROQ:
+        if config.api_key is None:
+            raise ValueError("Groq API ключ не настроен")
+        return GroqProvider(config)
+    if provider_type == LLMProviderType.OPENROUTER:
+        if config.api_key is None:
+            raise ValueError("OpenRouter API ключ не настроен")
+        return OpenRouterProvider(config)
+    return OllamaProvider(config)
+
+
+def _build_fallback(cfg: dict, temperature: float | None) -> FallbackProvider:
+    """Строит цепочку Groq → OpenRouter → Ollama из доступных.
+
+    Если основной (Groq) недоступен — повышаем следующий доступный
+    до primary, остальные становятся фолбэками. Это даёт работающую
+    цепочку даже когда верхний слой ещё не настроен.
+    """
+    order: list[LLMProviderType] = [
+        LLMProviderType.GROQ,
+        LLMProviderType.OPENROUTER,
+        LLMProviderType.OLLAMA,
+    ]
+    available: list[LLMProvider] = []
+    for ptype in order:
+        try:
+            p = _single_provider(ptype, cfg, temperature)
+        except ValueError:
+            continue
+        if p.is_available():
+            available.append(p)
+
+    if not available:
+        raise ValueError(
+            "Ни один LLM-провайдер не доступен. Настройте хотя бы один:\n"
+            "  - Groq: GROQ_API_KEY или [groq].api_key в config.local.toml;\n"
+            "  - OpenRouter: OPENROUTER_API_KEY или [openrouter].api_key;\n"
+            "  - Ollama: запустите `ollama serve`."
+        )
+
+    return FallbackProvider(available[0], available[1:])
+
+
 def get_llm_provider(
     provider_type: LLMProviderType | None = None,
     temperature: float | None = None,
     config_dict: dict | None = None,
 ) -> LLMProvider:
     """
-    Получить LLM-провайдер. Если provider_type=None, выбирается автоматически:
-    приоритет — Groq (если задан api_key), иначе Ollama.
+    Получить LLM-провайдер.
+
+    provider_type:
+        - None или FALLBACK — цепочка Groq → OpenRouter → Ollama
+          (по доступности; недоступные пропускаются);
+        - GROQ / OPENROUTER / OLLAMA — конкретный провайдер.
     """
     cfg = config_dict if config_dict is not None else CONFIG
 
-    if provider_type is None:
-        if _groq_api_key(cfg):
-            provider_type = LLMProviderType.GROQ
-        else:
-            ollama = OllamaProvider(_make_config(LLMProviderType.OLLAMA, cfg))
-            if ollama.is_available():
-                provider_type = LLMProviderType.OLLAMA
-            else:
-                raise ValueError(
-                    "Ни один LLM-провайдер не доступен:\n"
-                    "  - для Groq добавьте api_key в config.local.toml или "
-                    "переменную GROQ_API_KEY;\n"
-                    "  - для Ollama запустите `ollama serve`."
-                )
+    if provider_type is None or provider_type == LLMProviderType.FALLBACK:
+        return _build_fallback(cfg, temperature)
 
-    config = _make_config(provider_type, cfg, temperature=temperature)
-    if provider_type == LLMProviderType.GROQ:
-        if config.api_key is None:
-            raise ValueError("Groq API ключ не настроен")
-        return GroqProvider(config)
-    return OllamaProvider(config)
+    return _single_provider(provider_type, cfg, temperature)
 
 
 def list_available_providers(config_dict: dict | None = None) -> list[dict[str, Any]]:
@@ -243,12 +394,27 @@ def list_available_providers(config_dict: dict | None = None) -> list[dict[str, 
     groq_model = groq_cfg.get("model", "llama-3.1-8b-instant")
     groq_available = _groq_api_key(cfg) is not None
 
+    or_cfg = cfg.get("openrouter", {})
+    or_model = or_cfg.get("model", "meta-llama/llama-3.3-70b-instruct:free")
+    or_available = _openrouter_api_key(cfg) is not None
+
+    # Fallback доступен, если хоть один из трёх работает.
+    fallback_available = ollama_available or groq_available or or_available
+    chain_parts = []
+    if groq_available:
+        chain_parts.append("Groq")
+    if or_available:
+        chain_parts.append("OpenRouter")
+    if ollama_available:
+        chain_parts.append("Ollama")
+    fallback_model = " → ".join(chain_parts) if chain_parts else "—"
+
     return [
         {
-            "name": "Ollama",
-            "type": LLMProviderType.OLLAMA.value,
-            "available": ollama_available,
-            "model": ollama_model,
+            "name": "Авто (fallback)",
+            "type": LLMProviderType.FALLBACK.value,
+            "available": fallback_available,
+            "model": fallback_model,
         },
         {
             "name": "Groq",
@@ -256,14 +422,28 @@ def list_available_providers(config_dict: dict | None = None) -> list[dict[str, 
             "available": groq_available,
             "model": groq_model,
         },
+        {
+            "name": "OpenRouter",
+            "type": LLMProviderType.OPENROUTER.value,
+            "available": or_available,
+            "model": or_model,
+        },
+        {
+            "name": "Ollama",
+            "type": LLMProviderType.OLLAMA.value,
+            "available": ollama_available,
+            "model": ollama_model,
+        },
     ]
 
 
 __all__ = [
+    "FallbackProvider",
     "GroqProvider",
     "LLMProvider",
     "LLMProviderType",
     "OllamaProvider",
+    "OpenRouterProvider",
     "ProviderConfig",
     "get_llm_provider",
     "list_available_providers",
