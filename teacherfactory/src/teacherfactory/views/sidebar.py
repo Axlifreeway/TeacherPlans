@@ -24,6 +24,8 @@ def render_sidebar() -> tuple[str, str, int, str, int]:
         st.error("❌ Ни один LLM-провайдер не доступен.")
         st.info(
             "**Как настроить:**\n\n"
+            "- **Gemini**: `[gemini].api_key` в `config.local.toml` или `GEMINI_API_KEY`.\n"
+            "  Бесплатный ключ: https://aistudio.google.com/apikey\n"
             "- **Groq**: `[groq].api_key` в `config.local.toml` или `GROQ_API_KEY`.\n"
             "  Бесплатный ключ: https://console.groq.com/keys\n"
             "- **OpenRouter**: `[openrouter].api_key` или `OPENROUTER_API_KEY`.\n"
@@ -46,7 +48,7 @@ def render_sidebar() -> tuple[str, str, int, str, int]:
         format_func=lambda i: f"{available[i]['name']} ({available[i]['model']})",
         index=default_idx,
         help=(
-            "Авто (fallback) — по очереди Groq → OpenRouter → Ollama, "
+            "Авто (fallback) — по очереди Gemini → Groq → OpenRouter → Ollama, "
             "переключается при rate-limit. Конкретный провайдер — без переключения."
         ),
     )

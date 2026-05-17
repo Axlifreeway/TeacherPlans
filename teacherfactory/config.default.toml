@@ -34,6 +34,21 @@ keep_alive = "10m"       # держать модель в VRAM между зап
 provider = "ollama"
 hf_model = "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2"
 
+[gemini]
+# API-ключ Google AI Studio (бесплатный: https://aistudio.google.com/apikey).
+# Free-tier: 1500 запросов/день, 15 RPM, контекст 1M токенов — спокойно
+# тянет большие RAG-промпты, на которых упирается Groq.
+# Класть сюда в коммит нельзя — используй config.local.toml или
+# переменную окружения GEMINI_API_KEY (или GOOGLE_API_KEY).
+# api_key = "AI..."
+# model = "gemini-2.0-flash"
+#
+# Хорошие модели Gemini (бесплатный тариф):
+#   - gemini-2.0-flash             (дефолт, быстрый, контекст 1M)
+#   - gemini-2.0-flash-lite        (ещё быстрее, проще задачи)
+#   - gemini-2.5-flash             (новее, рассуждающий режим)
+#   - gemini-2.5-pro               (мощный, лимиты строже)
+
 [groq]
 # API-ключ Groq (бесплатный: https://console.groq.com/keys).
 # Класть сюда коммит-в-репо нельзя — продублируй в config.local.toml

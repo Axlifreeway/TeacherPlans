@@ -20,8 +20,9 @@ from teacherfactory.documents.lesson_card import LESSON_CARD
 from teacherfactory.paths import OUTPUT_DIR
 from teacherfactory.pipeline import generate_document
 from teacherfactory.render import build_output_filename, render_document
+from teacherfactory.topic_plan import TopicPlanItem, extract_topic_plan, slice_plan
 from teacherfactory.views.common import get_provider_for_session, index_ready
-from teacherfactory.views.errors import format_exception
+from teacherfactory.views.errors import format_exception, show_error
 from teacherfactory.views.single import (
     LESSON_KINDS,
     LESSON_TYPES,
@@ -151,20 +152,29 @@ def render(teacher: str, specialty: str, course: int, group: str, students: int)
             disabled=not with_assessment,
         )
 
-    topics_raw = st.text_area(
-        "Темы уроков",
-        "Основы сетевых протоколов\n"
-        "Адресация в IP-сетях | практическое занятие | 90\n"
-        "Маршрутизация | лабораторная работа | 90",
-        height=200,
-        key="b_topics",
+    st.divider()
+    mode = st.radio(
+        "Источник тем",
+        ["Авто (из РПД)", "Ручной список"],
+        horizontal=True,
+        key="b_mode",
+        help=(
+            "Авто — система достанет тематический план из проиндексированных РПД "
+            "по дисциплине и специальности. Ручной — вписать темы построчно."
+        ),
     )
-    items = parse_batch_topics(topics_raw, default_kind, default_duration)
+
+    if mode == "Авто (из РПД)":
+        items = _render_auto_topics_block(
+            discipline, specialty, default_kind, default_duration
+        )
+    else:
+        items = _render_manual_topics_block(default_kind, default_duration)
 
     if items:
         n_docs = len(items) + (1 if with_assessment else 0)
         st.info(f"Будет сгенерировано: **{n_docs}** документов ({len(items)} карт)")
-        with st.expander("Разбор строк (проверь, что вид распознан правильно)"):
+        with st.expander("Разбор тем (проверь перед генерацией)"):
             for it in items:
                 st.text(f"• {it.topic} → {it.kind}, {it.duration} мин")
 
@@ -196,6 +206,119 @@ def render(teacher: str, specialty: str, course: int, group: str, students: int)
             semester=semester,
             final_form=final_form,
         )
+
+
+# ─── Источники тем ────────────────────────────────────────────────────────────
+
+
+def _render_manual_topics_block(default_kind: str, default_duration: int) -> list[BatchItem]:
+    topics_raw = st.text_area(
+        "Темы уроков",
+        "Основы сетевых протоколов\n"
+        "Адресация в IP-сетях | практическое занятие | 90\n"
+        "Маршрутизация | лабораторная работа | 90",
+        height=200,
+        key="b_topics",
+        help="Формат: `Тема` или `Тема | Вид | Часы`. Одна тема на строку.",
+    )
+    return parse_batch_topics(topics_raw, default_kind, default_duration)
+
+
+def _render_auto_topics_block(
+    discipline: str,
+    specialty: str,
+    default_kind: str,
+    default_duration: int,
+) -> list[BatchItem]:
+    """Авто-режим: достать темы из РПД и предложить отредактировать.
+
+    Состояние извлечённого плана лежит в `st.session_state['auto_plan']` —
+    переживает rerender'ы Streamlit без повторного дёргания LLM.
+    """
+    c1, c2, c3 = st.columns([1, 1, 2])
+    with c1:
+        from_n = st.number_input("С урока №", min_value=1, value=1, key="b_auto_from")
+    with c2:
+        to_n = st.number_input(
+            "По урок №", min_value=int(from_n), value=max(int(from_n), 10), key="b_auto_to"
+        )
+    with c3:
+        st.caption(
+            "Система сама достанет темы из тематического плана РПД "
+            "и нумерует их сквозным счётчиком."
+        )
+
+    fetch = st.button("🔍 Найти темы в РПД", use_container_width=True, key="b_auto_fetch")
+
+    if fetch:
+        if not discipline.strip():
+            st.error("Укажи дисциплину.")
+        elif not specialty.strip():
+            st.error("Укажи специальность в боковой панели.")
+        elif not index_ready():
+            st.warning("Сначала постройте индекс документов.")
+        else:
+            with st.spinner(f"Ищу тематический план «{discipline}» в РПД..."):
+                try:
+                    provider = get_provider_for_session(temperature=0.0)
+                    plan = extract_topic_plan(discipline, specialty, provider=provider)
+                    st.session_state["auto_plan"] = plan
+                    st.session_state["auto_plan_key"] = (discipline, specialty)
+                except Exception as e:
+                    show_error("Не удалось извлечь тематический план", e)
+                    st.session_state.pop("auto_plan", None)
+
+    plan = st.session_state.get("auto_plan")
+    plan_key = st.session_state.get("auto_plan_key")
+    if plan is None or plan_key != (discipline, specialty):
+        st.caption("Нажми «Найти темы в РПД», чтобы загрузить тематический план.")
+        return []
+
+    if not plan.items:
+        st.warning(
+            "Тематический план для этой дисциплины в индексе не найден. "
+            "Проверь, что РПД дисциплины проиндексировано, или используй ручной режим."
+        )
+        return []
+
+    selected = slice_plan(plan, int(from_n), int(to_n))
+    st.success(
+        f"Найдено всего тем: **{len(plan.items)}**, "
+        f"в диапазон {from_n}..{to_n} попало: **{len(selected)}**."
+    )
+
+    with st.expander(f"Все найденные темы (полный план: {len(plan.items)})"):
+        for it in plan.items:
+            mark = " ✓" if from_n <= it.number <= to_n else ""
+            hours = f", {it.hours} ч" if it.hours else ""
+            kind = f" [{it.kind}]" if it.kind else ""
+            section = f" — раздел: {it.section}" if it.section else ""
+            st.caption(f"{it.number}. {it.title}{kind}{hours}{section}{mark}")
+
+    # Возможность подредактировать выбранные темы перед запуском.
+    return _plan_items_to_batch_items(selected, default_kind, default_duration)
+
+
+def _plan_items_to_batch_items(
+    plan_items: list[TopicPlanItem],
+    default_kind: str,
+    default_duration: int,
+) -> list[BatchItem]:
+    """Перевод TopicPlanItem (из РПД) в BatchItem (для пайплайна)."""
+    items: list[BatchItem] = []
+    for p in plan_items:
+        kind = p.kind or _guess_kind(p.title, default_kind)
+        # Часы → продолжительность в минутах. 1 ак.ч = 45 мин.
+        # Если в плане 2 ч на занятие — это 90 мин (один спаренный урок).
+        # Если 1 ч — берём 45. Если не указано — default.
+        if p.hours == 1:
+            duration = 45
+        elif p.hours >= 2:
+            duration = 90
+        else:
+            duration = default_duration
+        items.append(BatchItem(topic=p.title, kind=kind, duration=duration))
+    return items
 
 
 def _run_batch(

@@ -2,6 +2,7 @@
 Единый интерфейс для LLM-провайдеров.
 
 Поддерживает:
+- Gemini (Google AI Studio, бесплатный тариф 1500 RPD, контекст 1M)
 - Groq (облако, бесплатный тариф, быстро)
 - OpenRouter (облако, OpenAI-совместимый API, много моделей включая :free)
 - Ollama (локально)
@@ -17,7 +18,7 @@
 
 Fallback-цепочка:
     provider = get_llm_provider(LLMProviderType.FALLBACK)
-    # Внутри: Groq → OpenRouter → Ollama (порядок — по доступности).
+    # Внутри: Gemini → Groq → OpenRouter → Ollama (порядок — по доступности).
     # При rate-limit / сетевой ошибке langchain автоматически
     # перебирает провайдеров через Runnable.with_fallbacks.
 """
@@ -41,7 +42,8 @@ class LLMProviderType(StrEnum):
     OLLAMA = "ollama"
     GROQ = "groq"
     OPENROUTER = "openrouter"
-    FALLBACK = "fallback"  # цепочка Groq → OpenRouter → Ollama
+    GEMINI = "gemini"
+    FALLBACK = "fallback"  # цепочка Gemini → Groq → OpenRouter → Ollama
 
 
 class ProviderConfig(BaseModel):
@@ -157,6 +159,13 @@ class GroqProvider(LLMProvider):
             "temperature": self.config.temperature,
             "streaming": True,
             "max_tokens": max_out,
+            # Без явного таймаута httpx висит 600 с (дефолт openai/groq SDK) —
+            # на free-tier это превращает fallback в фикцию: запрос не
+            # бросает исключение, а просто стоит. 90 с хватает на честную
+            # генерацию большой карты, всё, что дольше — гарантированно
+            # rate-limit/очередь, и пусть пускают следующего.
+            "timeout": 90.0,
+            "max_retries": 1,
         }
         # reasoning_format="hidden" прячет <think>-блок на стороне Groq,
         # чтобы он не мешал langchain распарсить tool call.
@@ -201,6 +210,45 @@ class OpenRouterProvider(LLMProvider):
             streaming=True,
             max_tokens=8192,
             default_headers=default_headers,
+            # На :free-моделях OpenRouter любит молча держать запрос в
+            # очереди. Без таймаута fallback-цепочка зависает. 120 с —
+            # компромисс: реальная генерация 70B обычно укладывается,
+            # очередь — нет.
+            timeout=120.0,
+            max_retries=1,
+        )
+
+    def is_available(self) -> bool:
+        return self.config.api_key is not None
+
+
+class GeminiProvider(LLMProvider):
+    """Google Gemini через Google AI Studio API.
+
+    Free-tier: 1500 запросов/день, 15 RPM, 1M контекст. Гибкий по размеру
+    промпта — не упирается в Groq-овский TPM на больших RAG-контекстах.
+    Ключ: https://aistudio.google.com/apikey
+    """
+
+    @property
+    def name(self) -> str:
+        return "Gemini"
+
+    def _create_client(self) -> Any:
+        from langchain_google_genai import ChatGoogleGenerativeAI
+
+        if self.config.api_key is None:
+            raise ValueError("Gemini API ключ не настроен")
+
+        return ChatGoogleGenerativeAI(
+            api_key=self.config.api_key,
+            model=self.config.model_name,
+            temperature=self.config.temperature,
+            max_output_tokens=8192,
+            # Без таймаута langchain-google-genai по умолчанию ждёт минуты при
+            # очереди — fallback в этот момент не срабатывает.
+            timeout=120.0,
+            max_retries=1,
         )
 
     def is_available(self) -> bool:
@@ -214,6 +262,14 @@ class OpenRouterProvider(LLMProvider):
 # Импортируем лениво, чтобы не тянуть зависимости провайдеров до использования.
 def _fallback_exceptions() -> tuple[type[BaseException], ...]:
     excs: list[type[BaseException]] = [TimeoutError, ConnectionError]
+    # httpx — нижний слой openai/groq SDK. Без его таймаутов в списке
+    # ReadTimeout может проскочить мимо APIError и завесить цепочку.
+    try:
+        import httpx
+
+        excs.extend([httpx.TimeoutException, httpx.HTTPError])
+    except ImportError:
+        pass
     # Groq / OpenAI поднимают свои подклассы; импорт ленивый, чтобы не падать,
     # если соответствующий пакет не установлен.
     try:
@@ -275,6 +331,15 @@ def _openrouter_api_key(config_dict: dict) -> SecretStr | None:
     return SecretStr(raw) if raw else None
 
 
+def _gemini_api_key(config_dict: dict) -> SecretStr | None:
+    raw = (
+        config_dict.get("gemini", {}).get("api_key")
+        or os.getenv("GEMINI_API_KEY")
+        or os.getenv("GOOGLE_API_KEY")
+    )
+    return SecretStr(raw) if raw else None
+
+
 def _make_config(
     provider_type: LLMProviderType,
     config_dict: dict,
@@ -299,6 +364,14 @@ def _make_config(
                 model_name=or_cfg.get("model", "meta-llama/llama-3.3-70b-instruct:free"),
                 api_key=_openrouter_api_key(config_dict),
                 base_url=or_cfg.get("base_url", "https://openrouter.ai/api/v1"),
+                temperature=temp,
+            )
+        if provider_type == LLMProviderType.GEMINI:
+            gemini_cfg = config_dict.get("gemini", {})
+            return ProviderConfig(
+                provider_type=LLMProviderType.GEMINI,
+                model_name=gemini_cfg.get("model", "gemini-2.0-flash"),
+                api_key=_gemini_api_key(config_dict),
                 temperature=temp,
             )
         return ProviderConfig(
@@ -327,17 +400,24 @@ def _single_provider(
         if config.api_key is None:
             raise ValueError("OpenRouter API ключ не настроен")
         return OpenRouterProvider(config)
+    if provider_type == LLMProviderType.GEMINI:
+        if config.api_key is None:
+            raise ValueError("Gemini API ключ не настроен")
+        return GeminiProvider(config)
     return OllamaProvider(config)
 
 
 def _build_fallback(cfg: dict, temperature: float | None) -> FallbackProvider:
-    """Строит цепочку Groq → OpenRouter → Ollama из доступных.
+    """Строит цепочку Gemini → Groq → OpenRouter → Ollama из доступных.
 
-    Если основной (Groq) недоступен — повышаем следующий доступный
-    до primary, остальные становятся фолбэками. Это даёт работающую
-    цепочку даже когда верхний слой ещё не настроен.
+    Gemini ставим первым: free-tier 1500 RPD и контекст 1M токенов перекрывают
+    Groq-овский TPM-лимит, на котором большие RAG-запросы у нас разваливались.
+    Если основной недоступен — повышаем следующий доступный до primary,
+    остальные становятся фолбэками. Это даёт работающую цепочку даже когда
+    верхний слой ещё не настроен.
     """
     order: list[LLMProviderType] = [
+        LLMProviderType.GEMINI,
         LLMProviderType.GROQ,
         LLMProviderType.OPENROUTER,
         LLMProviderType.OLLAMA,
@@ -354,6 +434,7 @@ def _build_fallback(cfg: dict, temperature: float | None) -> FallbackProvider:
     if not available:
         raise ValueError(
             "Ни один LLM-провайдер не доступен. Настройте хотя бы один:\n"
+            "  - Gemini: GEMINI_API_KEY или [gemini].api_key в config.local.toml;\n"
             "  - Groq: GROQ_API_KEY или [groq].api_key в config.local.toml;\n"
             "  - OpenRouter: OPENROUTER_API_KEY или [openrouter].api_key;\n"
             "  - Ollama: запустите `ollama serve`."
@@ -371,9 +452,9 @@ def get_llm_provider(
     Получить LLM-провайдер.
 
     provider_type:
-        - None или FALLBACK — цепочка Groq → OpenRouter → Ollama
+        - None или FALLBACK — цепочка Gemini → Groq → OpenRouter → Ollama
           (по доступности; недоступные пропускаются);
-        - GROQ / OPENROUTER / OLLAMA — конкретный провайдер.
+        - GEMINI / GROQ / OPENROUTER / OLLAMA — конкретный провайдер.
     """
     cfg = config_dict if config_dict is not None else CONFIG
 
@@ -398,9 +479,17 @@ def list_available_providers(config_dict: dict | None = None) -> list[dict[str, 
     or_model = or_cfg.get("model", "meta-llama/llama-3.3-70b-instruct:free")
     or_available = _openrouter_api_key(cfg) is not None
 
-    # Fallback доступен, если хоть один из трёх работает.
-    fallback_available = ollama_available or groq_available or or_available
+    gemini_cfg = cfg.get("gemini", {})
+    gemini_model = gemini_cfg.get("model", "gemini-2.0-flash")
+    gemini_available = _gemini_api_key(cfg) is not None
+
+    # Fallback доступен, если хоть один из четырёх работает.
+    fallback_available = (
+        ollama_available or groq_available or or_available or gemini_available
+    )
     chain_parts = []
+    if gemini_available:
+        chain_parts.append("Gemini")
     if groq_available:
         chain_parts.append("Groq")
     if or_available:
@@ -415,6 +504,12 @@ def list_available_providers(config_dict: dict | None = None) -> list[dict[str, 
             "type": LLMProviderType.FALLBACK.value,
             "available": fallback_available,
             "model": fallback_model,
+        },
+        {
+            "name": "Gemini",
+            "type": LLMProviderType.GEMINI.value,
+            "available": gemini_available,
+            "model": gemini_model,
         },
         {
             "name": "Groq",
@@ -439,6 +534,7 @@ def list_available_providers(config_dict: dict | None = None) -> list[dict[str, 
 
 __all__ = [
     "FallbackProvider",
+    "GeminiProvider",
     "GroqProvider",
     "LLMProvider",
     "LLMProviderType",
